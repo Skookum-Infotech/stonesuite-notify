@@ -1,3 +1,24 @@
+# Build artifacts
 *.exe
+*.dll
+*.so
+*.dylib
 *.test
 *.out
+/bin/
+/dist/
+
+# Env / secrets
+.env
+.env.*
+*.pem
+*.key
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Claude Code local settings (machine-specific, not shared config)
+.claude/settings.local.json
