@@ -18,7 +18,18 @@ var ErrNotFound = errors.New("notification not found")
 // this interface (not *PGStore) so they can be tested with a fake store.
 type Store interface {
 	Create(ctx context.Context, in CreateInput) (*Notification, error)
-	ListForUser(ctx context.Context, tenantID, recipientUserID string, unreadOnly bool, limit int) ([]Notification, error)
+	// Get loads a single notification by id, scoped to tenant only (not
+	// recipient) — used by the delivery workers to read title/body/link/
+	// recipient_email fresh at send time via notification_id.
+	Get(ctx context.Context, tenantID, id string) (*Notification, error)
+	// ListForUser returns one page of the recipient's feed, newest first.
+	// The bell dropdown passes offset 0; the "view all" screen pages
+	// through with a non-zero offset.
+	ListForUser(ctx context.Context, tenantID, recipientUserID string, unreadOnly bool, limit, offset int) ([]Notification, error)
+	// CountForUser returns how many rows ListForUser would return in total
+	// under the same filter, ignoring paging — the denominator the "view
+	// all" screen needs to render page controls.
+	CountForUser(ctx context.Context, tenantID, recipientUserID string, unreadOnly bool) (int, error)
 	UnreadCount(ctx context.Context, tenantID, recipientUserID string) (int, error)
 	MarkRead(ctx context.Context, tenantID, recipientUserID, id string) error
 	MarkAllRead(ctx context.Context, tenantID, recipientUserID string) error
@@ -34,14 +45,14 @@ func NewPGStore(pool *pgxpool.Pool) *PGStore {
 	return &PGStore{pool: pool}
 }
 
-const notificationColumns = `id, tenant_id, recipient_user_id, actor_user_id, event_type, resource, resource_id, title, body, link, read_at, created_at`
+const notificationColumns = `id, tenant_id, recipient_user_id, recipient_email, actor_user_id, event_type, resource, resource_id, title, body, link, visible_in_app, read_at, created_at`
 
 func scanNotification(row pgx.Row) (*Notification, error) {
 	var n Notification
 	var actorUserID *string
 	if err := row.Scan(
-		&n.ID, &n.TenantID, &n.RecipientUserID, &actorUserID,
-		&n.EventType, &n.Resource, &n.ResourceID, &n.Title, &n.Body, &n.Link,
+		&n.ID, &n.TenantID, &n.RecipientUserID, &n.RecipientEmail, &actorUserID,
+		&n.EventType, &n.Resource, &n.ResourceID, &n.Title, &n.Body, &n.Link, &n.VisibleInApp,
 		&n.ReadAt, &n.CreatedAt,
 	); err != nil {
 		return nil, err
@@ -52,7 +63,10 @@ func scanNotification(row pgx.Row) (*Notification, error) {
 	return &n, nil
 }
 
-// Create inserts one notification row.
+// Create inserts one notification row. The row is always written
+// regardless of in.VisibleInApp — that flag only gates feed/bell
+// visibility, never row existence, since email/push delivery reads this
+// row's content via Get regardless of the in-app toggle.
 func (s *PGStore) Create(ctx context.Context, in CreateInput) (*Notification, error) {
 	var actorUserIDArg any
 	if in.ActorUserID != "" {
@@ -61,10 +75,10 @@ func (s *PGStore) Create(ctx context.Context, in CreateInput) (*Notification, er
 
 	row := s.pool.QueryRow(ctx, `
 		INSERT INTO notifications
-			(tenant_id, recipient_user_id, actor_user_id, event_type, resource, resource_id, title, body, link)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+			(tenant_id, recipient_user_id, recipient_email, actor_user_id, event_type, resource, resource_id, title, body, link, visible_in_app)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 		RETURNING `+notificationColumns,
-		in.TenantID, in.RecipientUserID, actorUserIDArg, in.EventType, in.Resource, in.ResourceID, in.Title, in.Body, in.Link)
+		in.TenantID, in.RecipientUserID, in.RecipientEmail, actorUserIDArg, in.EventType, in.Resource, in.ResourceID, in.Title, in.Body, in.Link, in.VisibleInApp)
 
 	n, err := scanNotification(row)
 	if err != nil {
@@ -73,21 +87,41 @@ func (s *PGStore) Create(ctx context.Context, in CreateInput) (*Notification, er
 	return n, nil
 }
 
-// ListForUser returns the recipient's notifications, newest first.
-func (s *PGStore) ListForUser(ctx context.Context, tenantID, recipientUserID string, unreadOnly bool, limit int) ([]Notification, error) {
-	if limit <= 0 || limit > 100 {
-		limit = 20
+// Get loads a single notification by id, scoped to tenant only — see the
+// Store interface doc for why this is not additionally scoped to recipient.
+func (s *PGStore) Get(ctx context.Context, tenantID, id string) (*Notification, error) {
+	row := s.pool.QueryRow(ctx, `
+		SELECT `+notificationColumns+`
+		FROM notifications WHERE id = $1 AND tenant_id = $2`,
+		id, tenantID)
+
+	n, err := scanNotification(row)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("get notification %s: %w", id, err)
 	}
+	return n, nil
+}
+
+// ListForUser returns one page of the recipient's notifications, newest
+// first.
+func (s *PGStore) ListForUser(ctx context.Context, tenantID, recipientUserID string, unreadOnly bool, limit, offset int) ([]Notification, error) {
+	limit, offset = NormalizePaging(limit, offset)
 
 	query := `SELECT ` + notificationColumns + `
 		FROM notifications
-		WHERE tenant_id = $1 AND recipient_user_id = $2`
+		WHERE tenant_id = $1 AND recipient_user_id = $2 AND visible_in_app = true`
 	if unreadOnly {
 		query += ` AND read_at IS NULL`
 	}
-	query += ` ORDER BY created_at DESC LIMIT $3`
+	// id breaks ties so paging is stable when several rows share a
+	// created_at — without it a row can repeat on one page and be skipped
+	// on the next.
+	query += ` ORDER BY created_at DESC, id DESC LIMIT $3 OFFSET $4`
 
-	rows, err := s.pool.Query(ctx, query, tenantID, recipientUserID, limit)
+	rows, err := s.pool.Query(ctx, query, tenantID, recipientUserID, limit, offset)
 	if err != nil {
 		return nil, fmt.Errorf("list notifications: %w", err)
 	}
@@ -107,13 +141,29 @@ func (s *PGStore) ListForUser(ctx context.Context, tenantID, recipientUserID str
 	return notifications, nil
 }
 
+// CountForUser returns the total number of feed rows matching the same
+// filter ListForUser applies, ignoring paging.
+func (s *PGStore) CountForUser(ctx context.Context, tenantID, recipientUserID string, unreadOnly bool) (int, error) {
+	query := `SELECT COUNT(*) FROM notifications
+		WHERE tenant_id = $1 AND recipient_user_id = $2 AND visible_in_app = true`
+	if unreadOnly {
+		query += ` AND read_at IS NULL`
+	}
+
+	var count int
+	if err := s.pool.QueryRow(ctx, query, tenantID, recipientUserID).Scan(&count); err != nil {
+		return 0, fmt.Errorf("count notifications: %w", err)
+	}
+	return count, nil
+}
+
 // UnreadCount returns the number of unread notifications for the recipient —
 // the value the frontend bell polls.
 func (s *PGStore) UnreadCount(ctx context.Context, tenantID, recipientUserID string) (int, error) {
 	var count int
 	err := s.pool.QueryRow(ctx, `
 		SELECT COUNT(*) FROM notifications
-		WHERE tenant_id = $1 AND recipient_user_id = $2 AND read_at IS NULL`,
+		WHERE tenant_id = $1 AND recipient_user_id = $2 AND visible_in_app = true AND read_at IS NULL`,
 		tenantID, recipientUserID).Scan(&count)
 	if err != nil {
 		return 0, fmt.Errorf("count unread notifications: %w", err)

@@ -200,3 +200,99 @@ are unexported constants in the `workers` package (2s consumer tick, 15s
 retry tick, 5-minute stale-processing threshold, batch size 20, 5 max
 attempts) — consistent with the existing "hardcode what doesn't need to vary
 per deployment" pattern in this codebase.
+
+---
+
+# Addendum — RBAC, Audit Trail, and Bell Completion
+
+Status: Approved (design phase) — 2026-07-24
+
+Sections 1–9 above cover the reliability layer (preferences, queue consumer,
+retry worker, delivery logs). This addendum covers the remaining production
+requirements: permission-protected user APIs, an audit trail, the paged
+"view all" screen the bell was missing, and one tenant-isolation defect
+found while wiring them up.
+
+## 10. RBAC
+
+**Problem.** This service owns no roles or permissions — StoneSuite-Backend
+does — and its JWTs carry only `id`, `email`, `tenant_id`, and
+`active_role_id`. There is no permission list to check against.
+
+**Decision.** `middleware.RequirePermission` reads an optional `permissions`
+claim, with a graded fallback:
+
+- Claim present → authoritative. Only what it lists is granted; `*` and
+  `notification:*` wildcards are honoured.
+- Claim absent (today's tokens) → the caller implicitly holds the
+  *self-service* set: `notification:read`, `notification:update`,
+  `preference:read`, `preference:update`, `push:manage`. Every store query
+  behind these is already scoped to `(tenant_id, recipient_user_id)`, so the
+  implicit grant never exposes another user's data.
+- *Elevated* permissions (`notification:admin`, `preference:admin`,
+  `audit:read`) are never implicitly granted — deny-by-default until the
+  backend mints them.
+
+The alternative of mirroring `role_permissions` locally was rejected: it
+would duplicate RBAC data this service explicitly does not own and drift
+from the backend. Requiring the claim unconditionally was rejected too — it
+would 403 every user out of their own notification bell until the backend
+changes.
+
+`middleware.Protected(secret, permission)` composes `RequireAuth` with
+`RequirePermission` so no route can be registered as merely "authenticated".
+
+**Tenant isolation is independent of this.** Every store query filters by
+`tenant_id` whether or not the permission layer is enforcing.
+
+## 11. Audit trail
+
+New `audit/` package and `notification_audit_logs` table (append-only: the
+`Store` interface exposes only `Record` and `List`).
+
+- **Async by construction.** `audit.Recorder` is an interface whose `Record`
+  has no error return — an audit write must never change the outcome of the
+  audited operation. `AsyncRecorder` detaches via `context.WithoutCancel`
+  so the write survives the handler returning, bounded by a 5s timeout, and
+  `Wait()` flushes in-flight entries during graceful shutdown.
+- **What's recorded:** notification creation (one entry per recipient),
+  read / read-all, preference and tenant-default changes, push
+  subscribe/unsubscribe, terminal delivery outcomes, and delivery-log reads
+  (which reveal who was contacted on which channel).
+- **What isn't:** intermediate retries. The delivery row already carries
+  `attempts` and `last_error`; auditing each attempt would bury the
+  outcomes. Failed operations are also never audited — an action that
+  didn't happen must not appear in the trail.
+- **Queryable** via `GET /api/admin/audit-logs` (`audit:read`, tenant from
+  JWT) and `GET /api/audit-logs?tenantId=` (internal secret). `tenant_id` is
+  always the first WHERE condition and is never caller-optional, so no
+  filter combination can widen a query past one tenant.
+
+## 12. Notification bell completion
+
+`ListForUser` gains an `offset`; new `CountForUser` returns the unpaged
+total under the same filter. `GET /api/notifications/history` serves the
+"view all" screen with `{notifications, pagination}`; `GET /api/notifications`
+is unchanged for the dropdown, so the existing frontend contract holds.
+
+Feed ordering gains an `id DESC` tiebreak — without it, rows sharing a
+`created_at` can repeat on one page and be skipped on the next.
+
+## 13. Tenant-isolation fix
+
+`deliveries.Store.ListForNotification` took only a notification id, so any
+holder of the internal secret could read **any** tenant's delivery log by
+id. It now takes `tenantID` and filters on it; `idx_deliveries_notification`
+becomes `(tenant_id, notification_id)` to match. The internal route requires
+an explicit `tenantId` parameter (400 without it); the admin route takes it
+from the caller's JWT.
+
+## 14. Testing
+
+Added: permission resolution (implicit self-service, explicit claim
+authority, wildcards, 401 vs 403), audit recorder (detached write survives
+cancellation, store failure swallowed, `Wait` flushes), audit query scoping
+and filter pass-through, history paging (totals, last page, cross-user
+isolation), delivery-log tenant isolation on both routes, audit emission
+from every mutating handler, and worker outcome auditing including the
+"retryable failure records nothing" case.

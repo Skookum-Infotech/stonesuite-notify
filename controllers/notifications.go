@@ -9,26 +9,35 @@ import (
 	"net/http"
 	"strconv"
 
-	"stonesuite-notify/channels"
+	"stonesuite-notify/audit"
 	"stonesuite-notify/config"
+	"stonesuite-notify/deliveries"
 	"stonesuite-notify/middleware"
 	"stonesuite-notify/models"
 	"stonesuite-notify/notifications"
-	"stonesuite-notify/pushsubs"
+	"stonesuite-notify/preferences"
 )
 
 // Handler exposes the notification HTTP endpoints against a Store.
 type Handler struct {
-	Store     notifications.Store
-	PushStore pushsubs.Store
-	Config    config.Config
+	Store           notifications.Store
+	PreferenceStore preferences.Store
+	DeliveryStore   deliveries.Store
+	Audit           audit.Recorder
+	Config          config.Config
 }
 
 // NewHandler builds a Handler backed by the given stores. Config carries the
-// email/push provider settings used to dispatch side channels after an
-// in-app notification is created.
-func NewHandler(store notifications.Store, pushStore pushsubs.Store, cfg config.Config) *Handler {
-	return &Handler{Store: store, PushStore: pushStore, Config: cfg}
+// email/push provider settings the workers package uses to actually send
+// once a delivery is enqueued here.
+func NewHandler(store notifications.Store, prefStore preferences.Store, deliveryStore deliveries.Store, recorder audit.Recorder, cfg config.Config) *Handler {
+	return &Handler{
+		Store:           store,
+		PreferenceStore: prefStore,
+		DeliveryStore:   deliveryStore,
+		Audit:           recorder,
+		Config:          cfg,
+	}
 }
 
 // Summary handles GET /api/notifications/summary — the endpoint the
@@ -53,8 +62,10 @@ func (h *Handler) Summary(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// List handles GET /api/notifications — the dropdown feed, optionally
-// filtered to unread-only, capped by limit (default/max enforced in Store).
+// List handles GET /api/notifications — the bell dropdown's "latest"
+// feed: newest first, optionally unread-only, capped by limit
+// (default/max enforced in Store). Use History for the paged "view all"
+// screen instead.
 func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 	user, err := middleware.GetUserFromContext(r.Context())
 	if err != nil {
@@ -63,14 +74,14 @@ func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 	}
 
 	unreadOnly := r.URL.Query().Get("unreadOnly") == "true"
-	limit := 20
+	limit := notifications.DefaultPageSize
 	if v := r.URL.Query().Get("limit"); v != "" {
 		if parsed, err := strconv.Atoi(v); err == nil {
 			limit = parsed
 		}
 	}
 
-	list, err := h.Store.ListForUser(r.Context(), user.TenantID, user.UserID, unreadOnly, limit)
+	list, err := h.Store.ListForUser(r.Context(), user.TenantID, user.UserID, unreadOnly, limit, 0)
 	if err != nil {
 		log.Printf("notifications: list for user %s: %v", user.UserID, err)
 		fail(w, http.StatusInternalServerError, "Failed to load notifications.")
@@ -80,6 +91,42 @@ func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, models.APIResponse{
 		Success: true,
 		Data:    map[string]any{"notifications": list},
+	})
+}
+
+// History handles GET /api/notifications/history — the bell's "view all"
+// screen. Same rows as List, but paged and accompanied by a total so the
+// client can render page controls.
+func (h *Handler) History(w http.ResponseWriter, r *http.Request) {
+	user, err := middleware.GetUserFromContext(r.Context())
+	if err != nil {
+		fail(w, http.StatusUnauthorized, "Authentication required.")
+		return
+	}
+
+	unreadOnly := r.URL.Query().Get("unreadOnly") == "true"
+	page, pageSize := parsePageParams(r.URL.Query(), notifications.DefaultPageSize, notifications.MaxPageSize)
+
+	total, err := h.Store.CountForUser(r.Context(), user.TenantID, user.UserID, unreadOnly)
+	if err != nil {
+		log.Printf("notifications: count history for user %s: %v", user.UserID, err)
+		fail(w, http.StatusInternalServerError, "Failed to load notifications.")
+		return
+	}
+
+	list, err := h.Store.ListForUser(r.Context(), user.TenantID, user.UserID, unreadOnly, pageSize, (page-1)*pageSize)
+	if err != nil {
+		log.Printf("notifications: list history for user %s: %v", user.UserID, err)
+		fail(w, http.StatusInternalServerError, "Failed to load notifications.")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, models.APIResponse{
+		Success: true,
+		Data: map[string]any{
+			"notifications": list,
+			"pagination":    newPagination(page, pageSize, total),
+		},
 	})
 }
 
@@ -107,6 +154,15 @@ func (h *Handler) MarkRead(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	h.Audit.Record(r.Context(), auditEntry(r, audit.Entry{
+		TenantID:    user.TenantID,
+		ActorUserID: user.UserID,
+		ActorType:   audit.ActorUser,
+		Action:      audit.ActionNotificationRead,
+		Resource:    audit.ResourceNotification,
+		ResourceID:  id,
+	}))
+
 	writeJSON(w, http.StatusOK, models.APIResponse{Success: true})
 }
 
@@ -123,6 +179,14 @@ func (h *Handler) MarkAllRead(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusInternalServerError, "Failed to mark notifications read.")
 		return
 	}
+
+	h.Audit.Record(r.Context(), auditEntry(r, audit.Entry{
+		TenantID:    user.TenantID,
+		ActorUserID: user.UserID,
+		ActorType:   audit.ActorUser,
+		Action:      audit.ActionNotificationReadAll,
+		Resource:    audit.ResourceNotification,
+	}))
 
 	writeJSON(w, http.StatusOK, models.APIResponse{Success: true})
 }
@@ -178,12 +242,19 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 
 	// Validate every recipient up front so a bad entry rejects the whole
 	// request instead of partially creating notifications for some
-	// recipients but not others.
-	inputs := make([]notifications.CreateInput, 0, len(req.Recipients))
+	// recipients but not others. Preferences are resolved per recipient
+	// only after validation passes, so an invalid entry never triggers a
+	// wasted preference lookup.
+	type plannedCreate struct {
+		input notifications.CreateInput
+		prefs preferences.Preferences
+	}
+	planned := make([]plannedCreate, 0, len(req.Recipients))
 	for _, recipient := range req.Recipients {
 		in := notifications.CreateInput{
 			TenantID:        req.TenantID,
 			RecipientUserID: recipient.UserID,
+			RecipientEmail:  recipient.Email,
 			ActorUserID:     req.ActorUserID,
 			EventType:       req.EventType,
 			Resource:        req.Resource,
@@ -196,22 +267,54 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 			fail(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		inputs = append(inputs, in)
+
+		prefs, err := h.PreferenceStore.Resolve(r.Context(), req.TenantID, recipient.UserID)
+		if err != nil {
+			// Fail open: an outage in the preferences table must never
+			// block the in-app row, which remains the source of truth.
+			log.Printf("notifications: resolve preferences for %s: %v", recipient.UserID, err)
+			prefs = preferences.Preferences{EmailEnabled: true, InAppEnabled: true, PushEnabled: true}
+		}
+		in.VisibleInApp = prefs.InAppEnabled
+
+		planned = append(planned, plannedCreate{input: in, prefs: prefs})
 	}
 
 	wantsEmail := containsChannel(req.Channels, channelEmail)
 
-	created := make([]*notifications.Notification, 0, len(inputs))
-	for i, in := range inputs {
-		n, err := h.Store.Create(r.Context(), in)
+	created := make([]*notifications.Notification, 0, len(planned))
+	for _, p := range planned {
+		n, err := h.Store.Create(r.Context(), p.input)
 		if err != nil {
-			log.Printf("notifications: create for recipient %s: %v", in.RecipientUserID, err)
+			log.Printf("notifications: create for recipient %s: %v", p.input.RecipientUserID, err)
 			continue
 		}
 		created = append(created, n)
+		h.enqueueDeliveries(r.Context(), *n, p.prefs, wantsEmail)
 
-		recipientEmail := req.Recipients[i].Email
-		go h.dispatchChannels(*n, recipientEmail, wantsEmail)
+		// One entry per notification, not per request, so the trail can
+		// answer "was this user ever notified about resource X" directly.
+		// The actor is the user whose action raised the event, if the
+		// calling service named one; the actor type stays "service"
+		// because the call itself came over the internal secret.
+		h.Audit.Record(r.Context(), auditEntry(r, audit.Entry{
+			TenantID:    n.TenantID,
+			ActorUserID: req.ActorUserID,
+			ActorType:   audit.ActorService,
+			Action:      audit.ActionNotificationCreated,
+			Resource:    audit.ResourceNotification,
+			ResourceID:  n.ID,
+			Metadata: audit.Metadata(map[string]any{
+				"recipientUserId": n.RecipientUserID,
+				"eventType":       n.EventType,
+				"resource":        n.Resource,
+				"resourceId":      n.ResourceID,
+				"visibleInApp":    n.VisibleInApp,
+				"emailEnabled":    p.prefs.EmailEnabled,
+				"pushEnabled":     p.prefs.PushEnabled,
+				"emailRequested":  wantsEmail,
+			}),
+		}))
 	}
 
 	if len(created) == 0 {
@@ -225,6 +328,75 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// Deliveries handles GET /api/notifications/{id}/deliveries — the
+// internal-secret-gated support/ops view of the delivery log (status
+// history + provider response per channel) for one notification. The
+// tenant is named explicitly because there is no JWT on this call path,
+// and it is required: without it the lookup would be scoped by
+// notification id alone and a leaked id would expose another tenant's log.
+func (h *Handler) Deliveries(w http.ResponseWriter, r *http.Request) {
+	tenantID := r.URL.Query().Get("tenantId")
+	if tenantID == "" {
+		fail(w, http.StatusBadRequest, "tenantId is required.")
+		return
+	}
+
+	h.deliveries(w, r, tenantID, audit.Entry{
+		TenantID:  tenantID,
+		ActorType: audit.ActorService,
+	})
+}
+
+// AdminDeliveries handles GET /api/admin/notifications/{id}/deliveries —
+// the same view for a signed-in tenant administrator, gated by the
+// notification:admin permission. The tenant comes from the caller's own
+// token, never the request, so an admin can only ever read their own
+// tenant's delivery log.
+func (h *Handler) AdminDeliveries(w http.ResponseWriter, r *http.Request) {
+	user, err := middleware.GetUserFromContext(r.Context())
+	if err != nil {
+		fail(w, http.StatusUnauthorized, "Authentication required.")
+		return
+	}
+
+	h.deliveries(w, r, user.TenantID, audit.Entry{
+		TenantID:    user.TenantID,
+		ActorUserID: user.UserID,
+		ActorType:   audit.ActorUser,
+	})
+}
+
+// deliveries serves both delivery-log routes. actor carries whichever
+// identity the caller's route established; this function fills in the rest
+// of the audit entry.
+func (h *Handler) deliveries(w http.ResponseWriter, r *http.Request, tenantID string, actor audit.Entry) {
+	id := r.PathValue("id")
+	if id == "" {
+		fail(w, http.StatusBadRequest, "Notification id is required.")
+		return
+	}
+
+	list, err := h.DeliveryStore.ListForNotification(r.Context(), tenantID, id)
+	if err != nil {
+		log.Printf("notifications: list deliveries for %s: %v", id, err)
+		fail(w, http.StatusInternalServerError, "Failed to load delivery log.")
+		return
+	}
+
+	// Reading a delivery log exposes who was contacted on which channel, so
+	// the read itself is auditable.
+	actor.Action = audit.ActionDeliveryLogViewed
+	actor.Resource = audit.ResourceNotification
+	actor.ResourceID = id
+	actor.Metadata = audit.Metadata(map[string]any{"deliveryCount": len(list)})
+	h.Audit.Record(r.Context(), auditEntry(r, actor))
+
+	writeJSON(w, http.StatusOK, models.APIResponse{
+		Success: true,
+		Data:    map[string]any{"deliveries": list},
+	})
+}
+
 func containsChannel(channelList []string, target string) bool {
 	for _, c := range channelList {
 		if c == target {
@@ -234,43 +406,30 @@ func containsChannel(channelList []string, target string) bool {
 	return false
 }
 
-// dispatchChannels fires the email and push side channels for one
-// already-persisted notification. It runs in its own goroutine, detached
-// from the request context, so a slow or failing provider never delays or
-// fails the create response — the in-app row is already the source of
-// truth by the time this runs.
-func (h *Handler) dispatchChannels(n notifications.Notification, recipientEmail string, wantsEmail bool) {
-	if wantsEmail && recipientEmail != "" {
-		if err := channels.SendNotificationEmail(h.Config, recipientEmail, n.Title, n.Body, n.Link); err != nil {
-			log.Printf("notifications: email dispatch for %s: %v", n.ID, err)
+// enqueueDeliveries writes the queue/log rows for one already-persisted
+// notification. in_app is recorded already-terminal (sent or skipped)
+// since the notifications row's existence/visibility is itself the
+// delivery; email and push are left pending for the workers package's
+// QueueConsumer to pick up. Failures here are logged, never surfaced — the
+// in-app row is already the source of truth.
+func (h *Handler) enqueueDeliveries(ctx context.Context, n notifications.Notification, prefs preferences.Preferences, wantsEmail bool) {
+	inAppStatus := deliveries.StatusSkipped
+	if prefs.InAppEnabled {
+		inAppStatus = deliveries.StatusSent
+	}
+	if _, err := h.DeliveryStore.Enqueue(ctx, n.ID, n.TenantID, n.RecipientUserID, deliveries.ChannelInApp, inAppStatus); err != nil {
+		log.Printf("notifications: enqueue in_app delivery log for %s: %v", n.ID, err)
+	}
+
+	if wantsEmail && prefs.EmailEnabled {
+		if _, err := h.DeliveryStore.Enqueue(ctx, n.ID, n.TenantID, n.RecipientUserID, deliveries.ChannelEmail, deliveries.StatusPending); err != nil {
+			log.Printf("notifications: enqueue email delivery for %s: %v", n.ID, err)
 		}
 	}
 
-	if !h.Config.PushConfigured() || h.PushStore == nil {
-		return
-	}
-
-	ctx := context.Background()
-	subs, err := h.PushStore.ListForUser(ctx, n.TenantID, n.RecipientUserID)
-	if err != nil {
-		log.Printf("notifications: list push subscriptions for %s: %v", n.RecipientUserID, err)
-		return
-	}
-
-	for _, sub := range subs {
-		stale, err := channels.SendWebPush(h.Config, channels.PushSubscription{
-			Endpoint: sub.Endpoint,
-			P256dh:   sub.P256dh,
-			Auth:     sub.Auth,
-		}, n.Title, n.Body, n.Link)
-		if err != nil {
-			log.Printf("notifications: push dispatch for %s: %v", n.ID, err)
-			continue
-		}
-		if stale {
-			if err := h.PushStore.Delete(ctx, n.TenantID, n.RecipientUserID, sub.Endpoint); err != nil {
-				log.Printf("notifications: prune stale push subscription %s: %v", sub.ID, err)
-			}
+	if prefs.PushEnabled && h.Config.PushConfigured() {
+		if _, err := h.DeliveryStore.Enqueue(ctx, n.ID, n.TenantID, n.RecipientUserID, deliveries.ChannelPush, deliveries.StatusPending); err != nil {
+			log.Printf("notifications: enqueue push delivery for %s: %v", n.ID, err)
 		}
 	}
 }

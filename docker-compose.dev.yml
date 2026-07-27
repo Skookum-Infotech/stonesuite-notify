@@ -1,0 +1,32 @@
+# Local dev-only Postgres + Mailpit (SMTP catcher), for exercising the
+# notify service end to end — including the email channel — without real
+# provider credentials. Self-contained: does not assume any other
+# StoneSuite service's containers exist. Not used in any deployed
+# environment. Managed by scripts/dev-up.sh / scripts/dev-down.sh.
+name: stonesuite-notify-dev
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: notify
+      POSTGRES_PASSWORD: notify
+      POSTGRES_DB: stonesuite_notify
+    ports:
+      - "5544:5432" # non-default host port so this can run alongside another local Postgres
+    volumes:
+      - notify-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U notify"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  mailpit:
+    image: axllent/mailpit
+    ports:
+      - "1025:1025" # SMTP
+      - "8025:8025" # web UI — view captured mail here
+
+volumes:
+  notify-pgdata:

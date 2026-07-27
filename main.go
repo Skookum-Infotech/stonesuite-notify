@@ -15,15 +15,28 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/joho/godotenv"
+
+	"stonesuite-notify/audit"
 	"stonesuite-notify/config"
 	"stonesuite-notify/controllers"
 	"stonesuite-notify/database"
+	"stonesuite-notify/deliveries"
 	"stonesuite-notify/middleware"
 	"stonesuite-notify/notifications"
+	"stonesuite-notify/preferences"
 	"stonesuite-notify/pushsubs"
+	"stonesuite-notify/workers"
 )
 
 func main() {
+	// Load environment variables from .env if it exists.
+	if err := godotenv.Load(); err != nil {
+		log.Println("warning: .env file not found, using system environment variables")
+	} else {
+		log.Println("Loaded environment variables from .env")
+	}
+
 	cfg, err := config.Load()
 	if err != nil {
 		log.Fatalf("CRITICAL: config: %v", err)
@@ -51,8 +64,23 @@ func main() {
 
 	store := notifications.NewPGStore(pool)
 	pushStore := pushsubs.NewPGStore(pool)
-	handler := controllers.NewHandler(store, pushStore, cfg)
-	pushHandler := controllers.NewPushHandler(pushStore, cfg.VAPIDPublicKey)
+	prefStore := preferences.NewPGStore(pool)
+	deliveryStore := deliveries.NewPGStore(pool)
+	auditStore := audit.NewPGStore(pool)
+
+	// One recorder shared by every handler and both workers: audit writes
+	// are detached from the request, and Wait (below) flushes anything
+	// still in flight before the process exits.
+	auditRecorder := audit.NewAsyncRecorder(auditStore)
+
+	handler := controllers.NewHandler(store, prefStore, deliveryStore, auditRecorder, cfg)
+	pushHandler := controllers.NewPushHandler(pushStore, auditRecorder, cfg.VAPIDPublicKey)
+	prefHandler := controllers.NewPreferencesHandler(prefStore, auditRecorder)
+	auditHandler := controllers.NewAuditHandler(auditStore)
+
+	workerDeps := workers.NewDeps(store, deliveryStore, pushStore, auditRecorder, cfg)
+	go workers.QueueConsumer{Deps: workerDeps}.Run(ctx)
+	go workers.RetryWorker{Deps: workerDeps}.Run(ctx)
 
 	mux := http.NewServeMux()
 
@@ -70,18 +98,45 @@ func main() {
 		_, _ = w.Write([]byte(`{"success":true}`))
 	})
 
-	requireAuth := middleware.RequireAuth(cfg.JWTSecret)
 	requireInternal := middleware.RequireInternalSecret(cfg.InternalServiceSecret)
 
-	mux.Handle("GET /api/notifications/summary", requireAuth(http.HandlerFunc(handler.Summary)))
-	mux.Handle("GET /api/notifications", requireAuth(http.HandlerFunc(handler.List)))
-	mux.Handle("POST /api/notifications/read-all", requireAuth(http.HandlerFunc(handler.MarkAllRead)))
-	mux.Handle("POST /api/notifications/{id}/read", requireAuth(http.HandlerFunc(handler.MarkRead)))
-	mux.Handle("POST /api/notifications/internal", requireInternal(http.HandlerFunc(handler.Create)))
+	// protected composes RequireAuth with a permission check, so every
+	// user-facing route below states the permission it needs and none can
+	// be registered as merely "authenticated". See middleware/permissions.go
+	// for how permissions resolve against StoneSuite-Backend's tokens.
+	protected := func(permission string) func(http.Handler) http.Handler {
+		return middleware.Protected(cfg.JWTSecret, permission)
+	}
+
+	// The notification bell: unread badge, latest dropdown, paged "view
+	// all", and the two read-state writes.
+	mux.Handle("GET /api/notifications/summary", protected(middleware.PermNotificationRead)(http.HandlerFunc(handler.Summary)))
+	mux.Handle("GET /api/notifications", protected(middleware.PermNotificationRead)(http.HandlerFunc(handler.List)))
+	mux.Handle("GET /api/notifications/history", protected(middleware.PermNotificationRead)(http.HandlerFunc(handler.History)))
+	mux.Handle("POST /api/notifications/read-all", protected(middleware.PermNotificationUpdate)(http.HandlerFunc(handler.MarkAllRead)))
+	mux.Handle("POST /api/notifications/{id}/read", protected(middleware.PermNotificationUpdate)(http.HandlerFunc(handler.MarkRead)))
 
 	mux.HandleFunc("GET /api/push/vapid-public-key", pushHandler.VAPIDKey)
-	mux.Handle("POST /api/push/subscribe", requireAuth(http.HandlerFunc(pushHandler.Subscribe)))
-	mux.Handle("DELETE /api/push/subscribe", requireAuth(http.HandlerFunc(pushHandler.Unsubscribe)))
+	mux.Handle("POST /api/push/subscribe", protected(middleware.PermPushManage)(http.HandlerFunc(pushHandler.Subscribe)))
+	mux.Handle("DELETE /api/push/subscribe", protected(middleware.PermPushManage)(http.HandlerFunc(pushHandler.Unsubscribe)))
+
+	mux.Handle("GET /api/preferences", protected(middleware.PermPreferenceRead)(http.HandlerFunc(prefHandler.Get)))
+	mux.Handle("PUT /api/preferences", protected(middleware.PermPreferenceUpdate)(http.HandlerFunc(prefHandler.Update)))
+
+	// Tenant-wide routes for a signed-in administrator. These take the
+	// tenant from the caller's own token, never the request body, and need
+	// an elevated permission that is never implicitly granted.
+	mux.Handle("GET /api/admin/tenant-defaults", protected(middleware.PermPreferenceAdmin)(http.HandlerFunc(prefHandler.AdminGetTenantDefaults)))
+	mux.Handle("PUT /api/admin/tenant-defaults", protected(middleware.PermPreferenceAdmin)(http.HandlerFunc(prefHandler.AdminSetTenantDefaults)))
+	mux.Handle("GET /api/admin/notifications/{id}/deliveries", protected(middleware.PermNotificationAdmin)(http.HandlerFunc(handler.AdminDeliveries)))
+	mux.Handle("GET /api/admin/audit-logs", protected(middleware.PermAuditRead)(http.HandlerFunc(auditHandler.List)))
+
+	// Service-to-service routes: no end-user session, gated by the shared
+	// internal secret, and each names its tenant explicitly.
+	mux.Handle("POST /api/notifications/internal", requireInternal(http.HandlerFunc(handler.Create)))
+	mux.Handle("GET /api/notifications/{id}/deliveries", requireInternal(http.HandlerFunc(handler.Deliveries)))
+	mux.Handle("PUT /api/tenant-defaults", requireInternal(http.HandlerFunc(prefHandler.SetTenantDefaults)))
+	mux.Handle("GET /api/audit-logs", requireInternal(http.HandlerFunc(auditHandler.ListInternal)))
 
 	globalHandler := withLogging(withCORS(mux, cfg.CorsOrigins))
 
@@ -98,6 +153,10 @@ func main() {
 		if err := server.Shutdown(shutdownCtx); err != nil {
 			log.Printf("server shutdown: %v", err)
 		}
+		// Audit writes are detached from their request, so in-flight
+		// entries would be lost if the process exited immediately after
+		// the last response.
+		auditRecorder.Wait()
 	}()
 
 	fmt.Println("===============================================")
@@ -125,7 +184,7 @@ func withCORS(next http.Handler, allowedOrigins []string) http.Handler {
 			w.Header().Set("Vary", "Origin")
 		}
 		w.Header().Set("Access-Control-Allow-Credentials", "true")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Internal-Secret")
 
 		if r.Method == http.MethodOptions {
