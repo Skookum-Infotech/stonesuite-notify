@@ -10,7 +10,7 @@ import (
 )
 
 func TestVAPIDKey_ReturnsPublicKey(t *testing.T) {
-	h := NewPushHandler(&fakePushStore{}, "test-public-key")
+	h := NewPushHandler(&fakePushStore{}, &fakeRecorder{}, "test-public-key")
 
 	req := httptest.NewRequest(http.MethodGet, "/api/push/vapid-public-key", nil)
 	rec := httptest.NewRecorder()
@@ -37,7 +37,7 @@ func subscribeBody(endpoint, p256dh, auth string) []byte {
 
 func TestSubscribe_SavesSubscriptionScopedToCaller(t *testing.T) {
 	store := &fakePushStore{}
-	h := NewPushHandler(store, "test-public-key")
+	h := NewPushHandler(store, &fakeRecorder{}, "test-public-key")
 
 	rec := authedRequest(t, http.MethodPost, "/api/push/subscribe", "t1", "u1",
 		subscribeBody("https://push.example.com/ep1", "p256dh-key", "auth-key"), h.Subscribe)
@@ -55,7 +55,7 @@ func TestSubscribe_SavesSubscriptionScopedToCaller(t *testing.T) {
 
 func TestSubscribe_RejectsMissingFields(t *testing.T) {
 	store := &fakePushStore{}
-	h := NewPushHandler(store, "test-public-key")
+	h := NewPushHandler(store, &fakeRecorder{}, "test-public-key")
 
 	body, _ := json.Marshal(map[string]string{"endpoint": "https://push.example.com/ep1"}) // missing keys
 	rec := authedRequest(t, http.MethodPost, "/api/push/subscribe", "t1", "u1", body, h.Subscribe)
@@ -74,7 +74,7 @@ func TestUnsubscribe_RemovesOnlyMatchingEndpointForCaller(t *testing.T) {
 		{TenantID: "t1", UserID: "u1", Endpoint: "https://push.example.com/remove"},
 		{TenantID: "t1", UserID: "other-user", Endpoint: "https://push.example.com/remove"}, // must survive
 	}}
-	h := NewPushHandler(store, "test-public-key")
+	h := NewPushHandler(store, &fakeRecorder{}, "test-public-key")
 
 	body, _ := json.Marshal(unsubscribeRequest{Endpoint: "https://push.example.com/remove"})
 	rec := authedRequest(t, http.MethodDelete, "/api/push/subscribe", "t1", "u1", body, h.Unsubscribe)

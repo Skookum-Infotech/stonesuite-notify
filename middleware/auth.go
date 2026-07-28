@@ -22,11 +22,18 @@ const userContextKey contextKey = "userContext"
 // UserContext holds the authenticated caller's identity, decoded from the
 // same JWT claim shape StoneSuite-Backend issues at login (id, email,
 // tenant_id, user_id, active_role_id).
+//
+// Permissions is read from an optional "permissions" claim. StoneSuite-
+// Backend does not mint it today, so it is usually empty — see Can in
+// permissions.go for how authorization degrades to the self-service set in
+// that case.
 type UserContext struct {
-	ID       string
-	Email    string
-	TenantID string
-	UserID   string
+	ID           string
+	Email        string
+	TenantID     string
+	UserID       string
+	ActiveRoleID string
+	Permissions  []string
 }
 
 // RequireAuth verifies the incoming JWT (Bearer header or the httpOnly
@@ -68,6 +75,7 @@ func RequireAuth(jwtSecret string) func(http.Handler) http.Handler {
 			identityID, okID := claims["id"].(string)
 			email, okEmail := claims["email"].(string)
 			tenantID, _ := claims["tenant_id"].(string)
+			activeRoleID, _ := claims["active_role_id"].(string)
 
 			if !okID || !okEmail || tenantID == "" {
 				deny(w, http.StatusUnauthorized, "Authentication failed. Invalid token claims.")
@@ -77,11 +85,13 @@ func RequireAuth(jwtSecret string) func(http.Handler) http.Handler {
 			// StoneSuite-Backend's tokens carry the caller's identity only in
 			// "id" — there is no separate "user_id" claim (generateTenantJWT
 			// never sets one), so "id" doubles as the per-user scoping key.
-			ctx := context.WithValue(r.Context(), userContextKey, UserContext{
-				ID:       identityID,
-				Email:    email,
-				TenantID: tenantID,
-				UserID:   identityID,
+			ctx := contextWithUser(r.Context(), UserContext{
+				ID:           identityID,
+				Email:        email,
+				TenantID:     tenantID,
+				UserID:       identityID,
+				ActiveRoleID: activeRoleID,
+				Permissions:  parsePermissionsClaim(claims["permissions"]),
 			})
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
@@ -103,6 +113,13 @@ func extractToken(r *http.Request) (string, bool) {
 		return cookie.Value, true
 	}
 	return "", false
+}
+
+// contextWithUser attaches an authenticated identity to a request context.
+// It is the only writer of userContextKey, so GetUserFromContext can rely
+// on the value's type.
+func contextWithUser(ctx context.Context, user UserContext) context.Context {
+	return context.WithValue(ctx, userContextKey, user)
 }
 
 // GetUserFromContext extracts the authenticated UserContext from a request

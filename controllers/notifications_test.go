@@ -4,18 +4,23 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
 
+	"stonesuite-notify/audit"
 	"stonesuite-notify/config"
+	"stonesuite-notify/deliveries"
 	"stonesuite-notify/middleware"
 	"stonesuite-notify/models"
 	"stonesuite-notify/notifications"
+	"stonesuite-notify/preferences"
 	"stonesuite-notify/pushsubs"
 )
 
@@ -39,6 +44,7 @@ func (f *fakeStore) Create(_ context.Context, in notifications.CreateInput) (*no
 		ID:              itoa(f.nextID),
 		TenantID:        in.TenantID,
 		RecipientUserID: in.RecipientUserID,
+		RecipientEmail:  in.RecipientEmail,
 		ActorUserID:     in.ActorUserID,
 		EventType:       in.EventType,
 		Resource:        in.Resource,
@@ -46,16 +52,51 @@ func (f *fakeStore) Create(_ context.Context, in notifications.CreateInput) (*no
 		Title:           in.Title,
 		Body:            in.Body,
 		Link:            in.Link,
+		VisibleInApp:    in.VisibleInApp,
 		CreatedAt:       time.Now(),
 	}
 	f.rows = append(f.rows, n)
 	return &n, nil
 }
 
-func (f *fakeStore) ListForUser(_ context.Context, tenantID, recipientUserID string, unreadOnly bool, limit int) ([]notifications.Notification, error) {
+func (f *fakeStore) Get(_ context.Context, tenantID, id string) (*notifications.Notification, error) {
 	if f.forceErr != nil {
 		return nil, f.forceErr
 	}
+	for _, n := range f.rows {
+		if n.ID == id && n.TenantID == tenantID {
+			return &n, nil
+		}
+	}
+	return nil, notifications.ErrNotFound
+}
+
+func (f *fakeStore) ListForUser(_ context.Context, tenantID, recipientUserID string, unreadOnly bool, limit, offset int) ([]notifications.Notification, error) {
+	if f.forceErr != nil {
+		return nil, f.forceErr
+	}
+	matching := f.matching(tenantID, recipientUserID, unreadOnly)
+
+	if offset >= len(matching) {
+		return nil, nil
+	}
+	end := offset + limit
+	if end > len(matching) {
+		end = len(matching)
+	}
+	return matching[offset:end], nil
+}
+
+func (f *fakeStore) CountForUser(_ context.Context, tenantID, recipientUserID string, unreadOnly bool) (int, error) {
+	if f.forceErr != nil {
+		return 0, f.forceErr
+	}
+	return len(f.matching(tenantID, recipientUserID, unreadOnly)), nil
+}
+
+// matching applies the same filter ListForUser and CountForUser share, so a
+// paged read and its total can never disagree.
+func (f *fakeStore) matching(tenantID, recipientUserID string, unreadOnly bool) []notifications.Notification {
 	var out []notifications.Notification
 	for _, n := range f.rows {
 		if n.TenantID != tenantID || n.RecipientUserID != recipientUserID {
@@ -65,11 +106,8 @@ func (f *fakeStore) ListForUser(_ context.Context, tenantID, recipientUserID str
 			continue
 		}
 		out = append(out, n)
-		if len(out) >= limit {
-			break
-		}
 	}
-	return out, nil
+	return out
 }
 
 func (f *fakeStore) UnreadCount(_ context.Context, tenantID, recipientUserID string) (int, error) {
@@ -118,6 +156,133 @@ func itoa(i int) string {
 	return strconv.Itoa(i)
 }
 
+// fakePreferencesStore is an in-memory preferences.Store used to test
+// Create's preference-gated enqueue behavior without a real database.
+// resolved is returned by Resolve for every recipient; use
+// newFakePreferencesStore for the common "everything enabled" default.
+type fakePreferencesStore struct {
+	resolved             preferences.Preferences
+	tenantDefaults       preferences.Preferences
+	resolveErr           error
+	lastOverride         preferences.OverrideInput
+	lastTenantDefaults   preferences.TenantDefaultsInput
+	lastTenantDefaultsID string
+	setOverrideHook      func(tenantID, userID string)
+}
+
+func newFakePreferencesStore() *fakePreferencesStore {
+	return &fakePreferencesStore{resolved: preferences.Preferences{EmailEnabled: true, InAppEnabled: true, PushEnabled: true}}
+}
+
+func (f *fakePreferencesStore) Resolve(_ context.Context, _, _ string) (preferences.Preferences, error) {
+	if f.resolveErr != nil {
+		return preferences.Preferences{}, f.resolveErr
+	}
+	return f.resolved, nil
+}
+
+func (f *fakePreferencesStore) GetUserOverride(_ context.Context, _, _ string) (preferences.OverrideInput, error) {
+	return preferences.OverrideInput{}, nil
+}
+
+func (f *fakePreferencesStore) SetUserOverride(_ context.Context, tenantID, userID string, in preferences.OverrideInput) error {
+	f.lastOverride = in
+	if f.setOverrideHook != nil {
+		f.setOverrideHook(tenantID, userID)
+	}
+	return nil
+}
+
+func (f *fakePreferencesStore) GetTenantDefaults(_ context.Context, _ string) (preferences.Preferences, error) {
+	return f.tenantDefaults, nil
+}
+
+func (f *fakePreferencesStore) SetTenantDefaults(_ context.Context, tenantID string, in preferences.TenantDefaultsInput) error {
+	f.lastTenantDefaultsID = tenantID
+	f.lastTenantDefaults = in
+	return nil
+}
+
+// fakeRecorder is a synchronous audit.Recorder that keeps entries in memory
+// so tests can assert on what was audited without waiting on a goroutine.
+type fakeRecorder struct {
+	mu      sync.Mutex
+	entries []audit.Entry
+}
+
+func (f *fakeRecorder) Record(_ context.Context, e audit.Entry) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.entries = append(f.entries, e)
+}
+
+func (f *fakeRecorder) find(action string) (audit.Entry, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, e := range f.entries {
+		if e.Action == action {
+			return e, true
+		}
+	}
+	return audit.Entry{}, false
+}
+
+// newTestHandler builds a Handler with a throwaway audit recorder, for the
+// tests that don't assert on the audit trail.
+func newTestHandler(store notifications.Store, prefStore preferences.Store, deliveryStore deliveries.Store, cfg config.Config) *Handler {
+	return NewHandler(store, prefStore, deliveryStore, &fakeRecorder{}, cfg)
+}
+
+// fakeDeliveriesStore is an in-memory deliveries.Store used to test
+// Create's enqueue behavior without a real database.
+type fakeDeliveriesStore struct {
+	rows []deliveries.Delivery
+}
+
+func (f *fakeDeliveriesStore) Enqueue(_ context.Context, notificationID, tenantID, recipientUserID, channel, status string) (*deliveries.Delivery, error) {
+	d := deliveries.Delivery{
+		ID: itoa(len(f.rows) + 1), NotificationID: notificationID, TenantID: tenantID,
+		RecipientUserID: recipientUserID, Channel: channel, Status: status, MaxAttempts: deliveries.MaxAttempts,
+	}
+	f.rows = append(f.rows, d)
+	return &d, nil
+}
+
+func (f *fakeDeliveriesStore) ClaimPending(_ context.Context, _ int) ([]deliveries.Delivery, error) {
+	return nil, nil
+}
+
+func (f *fakeDeliveriesStore) ClaimDue(_ context.Context, _ int, _ time.Duration) ([]deliveries.Delivery, error) {
+	return nil, nil
+}
+
+func (f *fakeDeliveriesStore) MarkSent(_ context.Context, _ string, _ []byte) error { return nil }
+
+func (f *fakeDeliveriesStore) MarkSkipped(_ context.Context, _ string, _ []byte) error { return nil }
+
+func (f *fakeDeliveriesStore) MarkRetrying(_ context.Context, _ string, _ int, _ string, _ []byte) error {
+	return nil
+}
+
+func (f *fakeDeliveriesStore) ListForNotification(_ context.Context, tenantID, notificationID string) ([]deliveries.Delivery, error) {
+	var out []deliveries.Delivery
+	for _, d := range f.rows {
+		if d.TenantID == tenantID && d.NotificationID == notificationID {
+			out = append(out, d)
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeDeliveriesStore) find(channel string) (deliveries.Delivery, bool) {
+	for _, d := range f.rows {
+		if d.Channel == channel {
+			return d, true
+		}
+	}
+	return deliveries.Delivery{}, false
+}
+
 // fakePushStore is an in-memory pushsubs.Store used so Create/dispatch
 // tests don't need a real database or network access.
 type fakePushStore struct {
@@ -159,6 +324,14 @@ func (f *fakePushStore) ListForUser(_ context.Context, tenantID, userID string) 
 // the same context-population path production traffic does.
 func authedRequest(t *testing.T, method, target, tenantID, userID string, body []byte, next http.HandlerFunc) *httptest.ResponseRecorder {
 	t.Helper()
+	return authedRequestWithPath(t, method, target, tenantID, userID, nil, body, next)
+}
+
+// authedRequestWithPath is authedRequest for routes with path wildcards
+// (e.g. "/api/notifications/{id}/read"), which httptest does not populate
+// on its own.
+func authedRequestWithPath(t *testing.T, method, target, tenantID, userID string, pathValues map[string]string, body []byte, next http.HandlerFunc) *httptest.ResponseRecorder {
+	t.Helper()
 
 	// Matches StoneSuite-Backend's real generateTenantJWT shape: "id" is the
 	// only per-user identifier — there is no separate "user_id" claim.
@@ -181,6 +354,9 @@ func authedRequest(t *testing.T, method, target, tenantID, userID string, body [
 	}
 	req := httptest.NewRequest(method, target, reqBody)
 	req.Header.Set("Authorization", "Bearer "+signed)
+	for key, value := range pathValues {
+		req.SetPathValue(key, value)
+	}
 
 	rec := httptest.NewRecorder()
 	middleware.RequireAuth(testJWTSecret)(next).ServeHTTP(rec, req)
@@ -202,7 +378,7 @@ func TestSummary_ReturnsUnreadCountForCaller(t *testing.T) {
 		{ID: "2", TenantID: "t1", RecipientUserID: "u1"},
 		{ID: "3", TenantID: "t1", RecipientUserID: "u2"}, // different user — must not be counted
 	}}
-	h := NewHandler(store, &fakePushStore{}, config.Config{})
+	h := newTestHandler(store, newFakePreferencesStore(), &fakeDeliveriesStore{}, config.Config{})
 
 	rec := authedRequest(t, http.MethodGet, "/api/notifications/summary", "t1", "u1", nil, h.Summary)
 
@@ -224,7 +400,7 @@ func TestList_ScopesToCallerOnly(t *testing.T) {
 		{ID: "1", TenantID: "t1", RecipientUserID: "u1", Title: "mine"},
 		{ID: "2", TenantID: "t1", RecipientUserID: "other-user", Title: "not mine"},
 	}}
-	h := NewHandler(store, &fakePushStore{}, config.Config{})
+	h := newTestHandler(store, newFakePreferencesStore(), &fakeDeliveriesStore{}, config.Config{})
 
 	rec := authedRequest(t, http.MethodGet, "/api/notifications", "t1", "u1", nil, h.List)
 
@@ -241,7 +417,7 @@ func TestList_ScopesToCallerOnly(t *testing.T) {
 
 func TestMarkRead_UnknownIDReturns404(t *testing.T) {
 	store := &fakeStore{}
-	h := NewHandler(store, &fakePushStore{}, config.Config{})
+	h := newTestHandler(store, newFakePreferencesStore(), &fakeDeliveriesStore{}, config.Config{})
 
 	req := httptest.NewRequest(http.MethodPost, "/api/notifications/does-not-exist/read", nil)
 	req.SetPathValue("id", "does-not-exist")
@@ -264,7 +440,7 @@ func TestMarkRead_UnknownIDReturns404(t *testing.T) {
 
 func TestCreate_RejectsMissingRequiredFields(t *testing.T) {
 	store := &fakeStore{}
-	h := NewHandler(store, &fakePushStore{}, config.Config{})
+	h := newTestHandler(store, newFakePreferencesStore(), &fakeDeliveriesStore{}, config.Config{})
 
 	body, _ := json.Marshal(map[string]string{"tenantId": "t1"}) // missing everything else
 	req := httptest.NewRequest(http.MethodPost, "/api/notifications/internal", bytes.NewReader(body))
@@ -279,7 +455,7 @@ func TestCreate_RejectsMissingRequiredFields(t *testing.T) {
 
 func TestCreate_PersistsValidNotification(t *testing.T) {
 	store := &fakeStore{}
-	h := NewHandler(store, &fakePushStore{}, config.Config{})
+	h := newTestHandler(store, newFakePreferencesStore(), &fakeDeliveriesStore{}, config.Config{})
 
 	body, _ := json.Marshal(createNotificationRequest{
 		TenantID:   "t1",
@@ -306,7 +482,7 @@ func TestCreate_MultipleRecipients_CreatesOneRowEach(t *testing.T) {
 	// Simulates a caller fanning a single business event out to every user
 	// holding a role (e.g. all "Managers") in one request.
 	store := &fakeStore{}
-	h := NewHandler(store, &fakePushStore{}, config.Config{})
+	h := newTestHandler(store, newFakePreferencesStore(), &fakeDeliveriesStore{}, config.Config{})
 
 	body, _ := json.Marshal(createNotificationRequest{
 		TenantID: "t1",
@@ -335,7 +511,7 @@ func TestCreate_MultipleRecipients_CreatesOneRowEach(t *testing.T) {
 
 func TestCreate_RejectsRecipientMissingUserID(t *testing.T) {
 	store := &fakeStore{}
-	h := NewHandler(store, &fakePushStore{}, config.Config{})
+	h := newTestHandler(store, newFakePreferencesStore(), &fakeDeliveriesStore{}, config.Config{})
 
 	body, _ := json.Marshal(createNotificationRequest{
 		TenantID:   "t1",
@@ -355,5 +531,397 @@ func TestCreate_RejectsRecipientMissingUserID(t *testing.T) {
 	}
 	if len(store.rows) != 0 {
 		t.Fatalf("store has %d rows, want 0 (invalid recipient must reject whole request)", len(store.rows))
+	}
+}
+
+func TestCreate_InAppDisabled_RowStillWrittenButHiddenAndDeliveryLogSkipped(t *testing.T) {
+	store := &fakeStore{}
+	prefs := &fakePreferencesStore{resolved: preferences.Preferences{EmailEnabled: true, InAppEnabled: false, PushEnabled: true}}
+	delivStore := &fakeDeliveriesStore{}
+	h := newTestHandler(store, prefs, delivStore, config.Config{})
+
+	body, _ := json.Marshal(createNotificationRequest{
+		TenantID:   "t1",
+		Recipients: []recipientTarget{{UserID: "u1"}},
+		EventType:  "invoice.approved",
+		Resource:   "invoice",
+		ResourceID: "inv-1",
+		Title:      "Invoice INV-1042 approved",
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/notifications/internal", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+
+	h.Create(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body: %s)", rec.Code, rec.Body.String())
+	}
+	if len(store.rows) != 1 {
+		t.Fatalf("store has %d rows, want 1 (row must always be written, regardless of in-app preference)", len(store.rows))
+	}
+	if store.rows[0].VisibleInApp {
+		t.Fatalf("VisibleInApp = true, want false")
+	}
+	inAppDelivery, ok := delivStore.find(deliveries.ChannelInApp)
+	if !ok {
+		t.Fatalf("no in_app delivery log row written")
+	}
+	if inAppDelivery.Status != deliveries.StatusSkipped {
+		t.Fatalf("in_app delivery status = %q, want %q", inAppDelivery.Status, deliveries.StatusSkipped)
+	}
+}
+
+func TestCreate_EmailRequestedButPreferenceDisabled_NotEnqueued(t *testing.T) {
+	store := &fakeStore{}
+	prefs := &fakePreferencesStore{resolved: preferences.Preferences{EmailEnabled: false, InAppEnabled: true, PushEnabled: true}}
+	delivStore := &fakeDeliveriesStore{}
+	h := newTestHandler(store, prefs, delivStore, config.Config{})
+
+	body, _ := json.Marshal(createNotificationRequest{
+		TenantID:   "t1",
+		Recipients: []recipientTarget{{UserID: "u1", Email: "u1@example.com"}},
+		EventType:  "invoice.approved",
+		Resource:   "invoice",
+		ResourceID: "inv-1",
+		Title:      "Invoice INV-1042 approved",
+		Channels:   []string{"email"},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/notifications/internal", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+
+	h.Create(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body: %s)", rec.Code, rec.Body.String())
+	}
+	if _, ok := delivStore.find(deliveries.ChannelEmail); ok {
+		t.Fatalf("email delivery was enqueued despite the recipient's preference disabling it")
+	}
+}
+
+func TestCreate_EmailRequestedAndEnabled_EnqueuedPending(t *testing.T) {
+	store := &fakeStore{}
+	delivStore := &fakeDeliveriesStore{}
+	h := newTestHandler(store, newFakePreferencesStore(), delivStore, config.Config{})
+
+	body, _ := json.Marshal(createNotificationRequest{
+		TenantID:   "t1",
+		Recipients: []recipientTarget{{UserID: "u1", Email: "u1@example.com"}},
+		EventType:  "invoice.approved",
+		Resource:   "invoice",
+		ResourceID: "inv-1",
+		Title:      "Invoice INV-1042 approved",
+		Channels:   []string{"email"},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/notifications/internal", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+
+	h.Create(rec, req)
+
+	emailDelivery, ok := delivStore.find(deliveries.ChannelEmail)
+	if !ok {
+		t.Fatalf("no email delivery row enqueued")
+	}
+	if emailDelivery.Status != deliveries.StatusPending {
+		t.Fatalf("email delivery status = %q, want %q", emailDelivery.Status, deliveries.StatusPending)
+	}
+}
+
+func TestCreate_PushEnabledAndConfigured_EnqueuedPending(t *testing.T) {
+	store := &fakeStore{}
+	delivStore := &fakeDeliveriesStore{}
+	cfg := config.Config{VAPIDPublicKey: "pub", VAPIDPrivateKey: "priv"}
+	h := newTestHandler(store, newFakePreferencesStore(), delivStore, cfg)
+
+	body, _ := json.Marshal(createNotificationRequest{
+		TenantID:   "t1",
+		Recipients: []recipientTarget{{UserID: "u1"}},
+		EventType:  "invoice.approved",
+		Resource:   "invoice",
+		ResourceID: "inv-1",
+		Title:      "Invoice INV-1042 approved",
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/notifications/internal", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+
+	h.Create(rec, req)
+
+	pushDelivery, ok := delivStore.find(deliveries.ChannelPush)
+	if !ok {
+		t.Fatalf("no push delivery row enqueued despite push being enabled and configured")
+	}
+	if pushDelivery.Status != deliveries.StatusPending {
+		t.Fatalf("push delivery status = %q, want %q", pushDelivery.Status, deliveries.StatusPending)
+	}
+}
+
+func TestCreate_PushNotConfigured_NotEnqueued(t *testing.T) {
+	store := &fakeStore{}
+	delivStore := &fakeDeliveriesStore{}
+	h := newTestHandler(store, newFakePreferencesStore(), delivStore, config.Config{}) // no VAPID keys
+
+	body, _ := json.Marshal(createNotificationRequest{
+		TenantID:   "t1",
+		Recipients: []recipientTarget{{UserID: "u1"}},
+		EventType:  "invoice.approved",
+		Resource:   "invoice",
+		ResourceID: "inv-1",
+		Title:      "Invoice INV-1042 approved",
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/notifications/internal", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+
+	h.Create(rec, req)
+
+	if _, ok := delivStore.find(deliveries.ChannelPush); ok {
+		t.Fatalf("push delivery was enqueued despite push not being configured")
+	}
+}
+
+func TestCreate_PreferenceResolveError_FailsOpenAndStillCreates(t *testing.T) {
+	store := &fakeStore{}
+	prefs := &fakePreferencesStore{resolveErr: errors.New("db down")}
+	h := newTestHandler(store, prefs, &fakeDeliveriesStore{}, config.Config{})
+
+	body, _ := json.Marshal(createNotificationRequest{
+		TenantID:   "t1",
+		Recipients: []recipientTarget{{UserID: "u1"}},
+		EventType:  "invoice.approved",
+		Resource:   "invoice",
+		ResourceID: "inv-1",
+		Title:      "Invoice INV-1042 approved",
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/notifications/internal", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+
+	h.Create(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (a preferences outage must not block notification creation)", rec.Code)
+	}
+	if len(store.rows) != 1 || !store.rows[0].VisibleInApp {
+		t.Fatalf("expected the row to be created and visible (fail-open default), got rows=%+v", store.rows)
+	}
+}
+
+// deliveryLogFixture is the delivery-log set shared by the tests below: two
+// rows for n1 in tenant t1, one for a different notification, and one for
+// the same notification id in a different tenant.
+func deliveryLogFixture() *fakeDeliveriesStore {
+	return &fakeDeliveriesStore{rows: []deliveries.Delivery{
+		{ID: "d1", NotificationID: "n1", TenantID: "t1", Channel: deliveries.ChannelEmail, Status: deliveries.StatusSent},
+		{ID: "d2", NotificationID: "n1", TenantID: "t1", Channel: deliveries.ChannelPush, Status: deliveries.StatusFailed},
+		{ID: "d3", NotificationID: "other-notification", TenantID: "t1", Channel: deliveries.ChannelEmail, Status: deliveries.StatusSent},
+		{ID: "d4", NotificationID: "n1", TenantID: "other-tenant", Channel: deliveries.ChannelEmail, Status: deliveries.StatusSent},
+	}}
+}
+
+func TestDeliveries_ReturnsLogForNotification(t *testing.T) {
+	h := newTestHandler(&fakeStore{}, newFakePreferencesStore(), deliveryLogFixture(), config.Config{})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/notifications/n1/deliveries?tenantId=t1", nil)
+	req.SetPathValue("id", "n1")
+	rec := httptest.NewRecorder()
+
+	h.Deliveries(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", rec.Code, rec.Body.String())
+	}
+	resp := decodeResponse(t, rec)
+	data := resp.Data.(map[string]any)
+	list := data["deliveries"].([]any)
+	if len(list) != 2 {
+		t.Fatalf("got %d deliveries, want 2 (must not leak other notifications' or tenants' rows)", len(list))
+	}
+}
+
+func TestDeliveries_RequiresTenantID(t *testing.T) {
+	// Without a tenant the lookup would be scoped by notification id alone,
+	// so a leaked id would expose another tenant's delivery log.
+	h := newTestHandler(&fakeStore{}, newFakePreferencesStore(), deliveryLogFixture(), config.Config{})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/notifications/n1/deliveries", nil)
+	req.SetPathValue("id", "n1")
+	rec := httptest.NewRecorder()
+
+	h.Deliveries(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+}
+
+func TestAdminDeliveries_ScopesToCallersOwnTenant(t *testing.T) {
+	// The admin route takes the tenant from the caller's token, so a
+	// notification id belonging to another tenant returns nothing even
+	// though a row with that id exists.
+	h := newTestHandler(&fakeStore{}, newFakePreferencesStore(), deliveryLogFixture(), config.Config{})
+
+	rec := authedRequestWithPath(t, http.MethodGet, "/api/admin/notifications/n1/deliveries",
+		"other-tenant", "admin-user", map[string]string{"id": "n1"}, nil, h.AdminDeliveries)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", rec.Code, rec.Body.String())
+	}
+	resp := decodeResponse(t, rec)
+	data := resp.Data.(map[string]any)
+	list := data["deliveries"].([]any)
+	if len(list) != 1 {
+		t.Fatalf("got %d deliveries, want 1 (only other-tenant's own row)", len(list))
+	}
+}
+
+func TestHistory_PagesThroughFeedWithTotal(t *testing.T) {
+	store := &fakeStore{}
+	for i := 0; i < 25; i++ {
+		store.rows = append(store.rows, notifications.Notification{
+			ID: itoa(i + 1), TenantID: "t1", RecipientUserID: "u1", VisibleInApp: true,
+		})
+	}
+	// A row belonging to someone else must not affect the caller's total.
+	store.rows = append(store.rows, notifications.Notification{ID: "x", TenantID: "t1", RecipientUserID: "u2"})
+
+	h := newTestHandler(store, newFakePreferencesStore(), &fakeDeliveriesStore{}, config.Config{})
+
+	rec := authedRequest(t, http.MethodGet, "/api/notifications/history?page=2&pageSize=10", "t1", "u1", nil, h.History)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", rec.Code, rec.Body.String())
+	}
+	resp := decodeResponse(t, rec)
+	data := resp.Data.(map[string]any)
+
+	list := data["notifications"].([]any)
+	if len(list) != 10 {
+		t.Fatalf("got %d notifications, want 10 (page 2 of 25 at pageSize 10)", len(list))
+	}
+
+	page := data["pagination"].(map[string]any)
+	if page["total"] != float64(25) {
+		t.Errorf("total = %v, want 25", page["total"])
+	}
+	if page["totalPages"] != float64(3) {
+		t.Errorf("totalPages = %v, want 3", page["totalPages"])
+	}
+	if page["hasMore"] != true {
+		t.Errorf("hasMore = %v, want true (page 2 of 3)", page["hasMore"])
+	}
+}
+
+func TestHistory_LastPageReportsNoMore(t *testing.T) {
+	store := &fakeStore{}
+	for i := 0; i < 15; i++ {
+		store.rows = append(store.rows, notifications.Notification{
+			ID: itoa(i + 1), TenantID: "t1", RecipientUserID: "u1", VisibleInApp: true,
+		})
+	}
+	h := newTestHandler(store, newFakePreferencesStore(), &fakeDeliveriesStore{}, config.Config{})
+
+	rec := authedRequest(t, http.MethodGet, "/api/notifications/history?page=2&pageSize=10", "t1", "u1", nil, h.History)
+
+	resp := decodeResponse(t, rec)
+	data := resp.Data.(map[string]any)
+	list := data["notifications"].([]any)
+	if len(list) != 5 {
+		t.Fatalf("got %d notifications, want 5 (remainder of 15 at pageSize 10)", len(list))
+	}
+	if data["pagination"].(map[string]any)["hasMore"] != false {
+		t.Fatalf("hasMore = true on the last page, want false")
+	}
+}
+
+func TestMarkRead_RecordsAuditEntry(t *testing.T) {
+	store := &fakeStore{rows: []notifications.Notification{
+		{ID: "n1", TenantID: "t1", RecipientUserID: "u1", VisibleInApp: true},
+	}}
+	recorder := &fakeRecorder{}
+	h := NewHandler(store, newFakePreferencesStore(), &fakeDeliveriesStore{}, recorder, config.Config{})
+
+	rec := authedRequestWithPath(t, http.MethodPost, "/api/notifications/n1/read",
+		"t1", "u1", map[string]string{"id": "n1"}, nil, h.MarkRead)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", rec.Code, rec.Body.String())
+	}
+	entry, ok := recorder.find(audit.ActionNotificationRead)
+	if !ok {
+		t.Fatalf("no %s audit entry recorded", audit.ActionNotificationRead)
+	}
+	if entry.TenantID != "t1" || entry.ActorUserID != "u1" || entry.ResourceID != "n1" {
+		t.Fatalf("audit entry = %+v, want tenant t1, actor u1, resource n1", entry)
+	}
+	if entry.ActorType != audit.ActorUser {
+		t.Fatalf("ActorType = %q, want %q", entry.ActorType, audit.ActorUser)
+	}
+}
+
+func TestMarkRead_FailureRecordsNoAuditEntry(t *testing.T) {
+	// An action that didn't happen must not appear in the trail.
+	recorder := &fakeRecorder{}
+	h := NewHandler(&fakeStore{}, newFakePreferencesStore(), &fakeDeliveriesStore{}, recorder, config.Config{})
+
+	rec := authedRequestWithPath(t, http.MethodPost, "/api/notifications/missing/read",
+		"t1", "u1", map[string]string{"id": "missing"}, nil, h.MarkRead)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", rec.Code)
+	}
+	if _, ok := recorder.find(audit.ActionNotificationRead); ok {
+		t.Fatal("audit entry recorded for a notification that was never marked read")
+	}
+}
+
+func TestMarkAllRead_RecordsAuditEntry(t *testing.T) {
+	store := &fakeStore{rows: []notifications.Notification{
+		{ID: "n1", TenantID: "t1", RecipientUserID: "u1"},
+	}}
+	recorder := &fakeRecorder{}
+	h := NewHandler(store, newFakePreferencesStore(), &fakeDeliveriesStore{}, recorder, config.Config{})
+
+	authedRequest(t, http.MethodPost, "/api/notifications/read-all", "t1", "u1", nil, h.MarkAllRead)
+
+	if _, ok := recorder.find(audit.ActionNotificationReadAll); !ok {
+		t.Fatalf("no %s audit entry recorded", audit.ActionNotificationReadAll)
+	}
+}
+
+func TestCreate_RecordsAuditEntryPerNotification(t *testing.T) {
+	recorder := &fakeRecorder{}
+	h := NewHandler(&fakeStore{}, newFakePreferencesStore(), &fakeDeliveriesStore{}, recorder, config.Config{})
+
+	body, _ := json.Marshal(createNotificationRequest{
+		TenantID: "t1",
+		Recipients: []recipientTarget{
+			{UserID: "u1", Email: "u1@example.com"},
+			{UserID: "u2", Email: "u2@example.com"},
+		},
+		ActorUserID: "actor-1",
+		EventType:   "quote.sent",
+		Resource:    "quote",
+		ResourceID:  "q-1",
+		Title:       "Quote Q-1 sent",
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/notifications/internal", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+
+	h.Create(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body: %s)", rec.Code, rec.Body.String())
+	}
+
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
+	if len(recorder.entries) != 2 {
+		t.Fatalf("recorded %d audit entries, want 2 (one per recipient)", len(recorder.entries))
+	}
+	for _, entry := range recorder.entries {
+		if entry.ActorType != audit.ActorService {
+			t.Errorf("ActorType = %q, want %q (the call arrives over the internal secret)", entry.ActorType, audit.ActorService)
+		}
+		if entry.ActorUserID != "actor-1" {
+			t.Errorf("ActorUserID = %q, want actor-1 (the user whose action raised the event)", entry.ActorUserID)
+		}
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"log"
 	"net/http"
 
+	"stonesuite-notify/audit"
 	"stonesuite-notify/middleware"
 	"stonesuite-notify/models"
 	"stonesuite-notify/pushsubs"
@@ -13,12 +14,13 @@ import (
 // PushHandler exposes the Web Push subscription endpoints.
 type PushHandler struct {
 	Store          pushsubs.Store
+	Audit          audit.Recorder
 	VAPIDPublicKey string
 }
 
 // NewPushHandler builds a PushHandler backed by the given store.
-func NewPushHandler(store pushsubs.Store, vapidPublicKey string) *PushHandler {
-	return &PushHandler{Store: store, VAPIDPublicKey: vapidPublicKey}
+func NewPushHandler(store pushsubs.Store, recorder audit.Recorder, vapidPublicKey string) *PushHandler {
+	return &PushHandler{Store: store, Audit: recorder, VAPIDPublicKey: vapidPublicKey}
 }
 
 // VAPIDKey handles GET /api/push/vapid-public-key. The public key is not
@@ -70,6 +72,14 @@ func (h *PushHandler) Subscribe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	h.Audit.Record(r.Context(), auditEntry(r, audit.Entry{
+		TenantID:    user.TenantID,
+		ActorUserID: user.UserID,
+		ActorType:   audit.ActorUser,
+		Action:      audit.ActionPushSubscribed,
+		Resource:    audit.ResourcePushSub,
+	}))
+
 	writeJSON(w, http.StatusOK, models.APIResponse{Success: true})
 }
 
@@ -100,6 +110,14 @@ func (h *PushHandler) Unsubscribe(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusInternalServerError, "Failed to remove push subscription.")
 		return
 	}
+
+	h.Audit.Record(r.Context(), auditEntry(r, audit.Entry{
+		TenantID:    user.TenantID,
+		ActorUserID: user.UserID,
+		ActorType:   audit.ActorUser,
+		Action:      audit.ActionPushUnsubscribed,
+		Resource:    audit.ResourcePushSub,
+	}))
 
 	writeJSON(w, http.StatusOK, models.APIResponse{Success: true})
 }
