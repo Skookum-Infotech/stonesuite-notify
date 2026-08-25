@@ -42,6 +42,12 @@ func (f *fakeNotifications) ListForUser(_ context.Context, _, _ string, _ bool, 
 func (f *fakeNotifications) UnreadCount(_ context.Context, _, _ string) (int, error) { return 0, nil }
 func (f *fakeNotifications) MarkRead(_ context.Context, _, _, _ string) error        { return nil }
 func (f *fakeNotifications) MarkAllRead(_ context.Context, _, _ string) error        { return nil }
+func (f *fakeNotifications) SaveAttachment(_ context.Context, _ string, _ notifications.AttachmentInput) error {
+	return nil
+}
+func (f *fakeNotifications) GetAttachment(_ context.Context, _, _ string) (*notifications.AttachmentInput, error) {
+	return nil, nil
+}
 
 // fakeDeliveries is an in-memory deliveries.Store recording the last
 // MarkSent/MarkSkipped/MarkRetrying call so tests can assert on outcome.

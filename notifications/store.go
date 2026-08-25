@@ -33,6 +33,15 @@ type Store interface {
 	UnreadCount(ctx context.Context, tenantID, recipientUserID string) (int, error)
 	MarkRead(ctx context.Context, tenantID, recipientUserID, id string) error
 	MarkAllRead(ctx context.Context, tenantID, recipientUserID string) error
+	// SaveAttachment persists the single attachment for a notification's
+	// email delivery. Called at most once per notification, from
+	// controllers.Handler.Create, only when email delivery was actually
+	// requested for that recipient.
+	SaveAttachment(ctx context.Context, notificationID string, a AttachmentInput) error
+	// GetAttachment loads a notification's attachment, if any. Returns
+	// (nil, nil) — not an error — when the notification has none, since
+	// the overwhelming majority of notifications never do.
+	GetAttachment(ctx context.Context, tenantID, notificationID string) (*AttachmentInput, error)
 }
 
 // PGStore implements Store against Postgres.
@@ -196,4 +205,43 @@ func (s *PGStore) MarkAllRead(ctx context.Context, tenantID, recipientUserID str
 		return fmt.Errorf("mark all notifications read: %w", err)
 	}
 	return nil
+}
+
+// SaveAttachment inserts (or replaces, on the rare case of a retry)
+// notification_id's attachment row.
+func (s *PGStore) SaveAttachment(ctx context.Context, notificationID string, a AttachmentInput) error {
+	_, err := s.pool.Exec(ctx, `
+		INSERT INTO notification_attachments (notification_id, file_name, content_type, content)
+		VALUES ($1, $2, $3, $4)
+		ON CONFLICT (notification_id) DO UPDATE
+			SET file_name = EXCLUDED.file_name,
+			    content_type = EXCLUDED.content_type,
+			    content = EXCLUDED.content`,
+		notificationID, a.FileName, a.ContentType, a.Content)
+	if err != nil {
+		return fmt.Errorf("save notification attachment %s: %w", notificationID, err)
+	}
+	return nil
+}
+
+// GetAttachment loads notificationID's attachment, scoped to tenant like
+// Get — defense in depth even though notification_id is already a
+// globally-unique UUID, matching this store's existing scoping discipline.
+// Returns (nil, nil) when the notification has no attachment row, which is
+// the common case.
+func (s *PGStore) GetAttachment(ctx context.Context, tenantID, notificationID string) (*AttachmentInput, error) {
+	var a AttachmentInput
+	err := s.pool.QueryRow(ctx, `
+		SELECT na.file_name, na.content_type, na.content
+		FROM notification_attachments na
+		JOIN notifications n ON n.id = na.notification_id
+		WHERE na.notification_id = $1 AND n.tenant_id = $2`,
+		notificationID, tenantID).Scan(&a.FileName, &a.ContentType, &a.Content)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get notification attachment %s: %w", notificationID, err)
+	}
+	return &a, nil
 }

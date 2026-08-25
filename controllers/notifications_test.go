@@ -152,6 +152,13 @@ func (f *fakeStore) MarkAllRead(_ context.Context, tenantID, recipientUserID str
 	return nil
 }
 
+func (f *fakeStore) SaveAttachment(_ context.Context, _ string, _ notifications.AttachmentInput) error {
+	return nil
+}
+func (f *fakeStore) GetAttachment(_ context.Context, _, _ string) (*notifications.AttachmentInput, error) {
+	return nil, nil
+}
+
 func itoa(i int) string {
 	return strconv.Itoa(i)
 }
