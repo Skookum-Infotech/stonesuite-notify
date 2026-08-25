@@ -46,6 +46,15 @@ type CreateInput struct {
 	VisibleInApp    bool   `json:"visibleInApp"`
 }
 
+// AttachmentInput is the optional single file attached to a notification's
+// email delivery. Persisted in notification_attachments, not on the
+// notification row itself — see that table's doc comment in schema.sql.
+type AttachmentInput struct {
+	FileName    string
+	ContentType string
+	Content     []byte
+}
+
 // Paging bounds for the feed. DefaultPageSize matches what the bell
 // dropdown asks for; MaxPageSize caps the "view all" screen so no caller
 // can pull an unbounded history in one request.

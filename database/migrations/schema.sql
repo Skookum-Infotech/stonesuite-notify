@@ -148,4 +148,47 @@ CREATE INDEX IF NOT EXISTS idx_audit_tenant_action
     ON notification_audit_logs (tenant_id, action, created_at DESC);
 
 CREATE INDEX IF NOT EXISTS idx_audit_tenant_actor
-    ON notification_audit_logs (tenant_id, actor_user_id, created_at DESC);
+    ON notification_audit_logs (environment, tenant_id, actor_user_id, created_at DESC);
+
+-- Replaces the single global INTERNAL_SERVICE_SECRET (middleware/auth.go).
+-- Each row is one scoped, environment-bound credential: key_hash is
+-- SHA-256(secret) — not a slow password KDF, deliberately, since the
+-- secret itself carries 256 bits of entropy and is verified on every
+-- request (see CLAUDE.md/design notes on this trade-off). scopes is a
+-- JSON array of strings like ["messages:create"] or ["admin:*"], checked
+-- by middleware.RequireInternalSecret. environment is read from this row
+-- and never from the request body — the primary control that makes a dev
+-- key physically unable to write a production row.
+CREATE TABLE IF NOT EXISTS service_api_keys (
+    id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name          VARCHAR(64)  NOT NULL,
+    environment   VARCHAR(16)  NOT NULL,
+    key_hash      BYTEA        NOT NULL UNIQUE,
+    scopes        JSONB        NOT NULL DEFAULT '[]',
+    active        BOOLEAN      NOT NULL DEFAULT true,
+    last_used_at  TIMESTAMPTZ,
+    revoked_at    TIMESTAMPTZ,
+    created_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
+-- The auth hot path looks up by hash directly (key_hash is already UNIQUE,
+-- so Postgres already maintains a btree for it); this index instead serves
+-- admin/ops listing and the rotation runbook ("all active keys for this
+-- environment").
+CREATE INDEX IF NOT EXISTS idx_service_api_keys_environment
+    ON service_api_keys (environment, active);
+
+-- notification_attachments holds at most one binary attachment per
+-- notification — currently used only for the "document sent" owner
+-- notification, which carries the same PDF the customer received. This is
+-- deliberately its own table, not a column on notifications: notifications
+-- is read in bulk by the feed/list/summary endpoints backing the in-app
+-- bell UI, and this table is read only by the email delivery worker, one
+-- row at a time, by notification_id.
+CREATE TABLE IF NOT EXISTS notification_attachments (
+    notification_id UUID PRIMARY KEY REFERENCES notifications(id) ON DELETE CASCADE,
+    file_name        TEXT NOT NULL,
+    content_type     TEXT NOT NULL,
+    content          BYTEA NOT NULL,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);

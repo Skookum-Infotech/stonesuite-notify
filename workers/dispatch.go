@@ -30,7 +30,7 @@ type Deps struct {
 	PushSubs      pushsubs.Store
 	Audit         audit.Recorder
 	Config        config.Config
-	SendEmail     func(cfg config.Config, to, title, body, link string) error
+	SendEmail     func(cfg config.Config, to, title, body, link string, attachment *channels.EmailAttachment) error
 	SendPush      func(cfg config.Config, sub channels.PushSubscription, title, body, link string) (stale bool, err error)
 }
 
@@ -106,7 +106,15 @@ func attemptDelivery(ctx context.Context, deps Deps, d deliveries.Delivery) {
 }
 
 func attemptEmail(ctx context.Context, deps Deps, d deliveries.Delivery, n notifications.Notification) {
-	if err := deps.SendEmail(deps.Config, n.RecipientEmail, n.Title, n.Body, n.Link); err != nil {
+	var attachment *channels.EmailAttachment
+	att, err := deps.Notifications.GetAttachment(ctx, n.TenantID, n.ID)
+	if err != nil {
+		log.Printf("workers: load attachment for notification %s: %v", n.ID, err)
+	} else if att != nil {
+		attachment = &channels.EmailAttachment{FileName: att.FileName, ContentType: att.ContentType, Content: att.Content}
+	}
+
+	if err := deps.SendEmail(deps.Config, n.RecipientEmail, n.Title, n.Body, n.Link, attachment); err != nil {
 		log.Printf("workers: email delivery %s: %v", d.ID, err)
 		markFailedAttempt(ctx, deps, d, err.Error(), nil)
 		return

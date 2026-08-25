@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	"stonesuite-notify/channels"
 	"stonesuite-notify/config"
 	"stonesuite-notify/deliveries"
 	"stonesuite-notify/notifications"
@@ -32,7 +33,7 @@ func TestQueueConsumer_PollOnce_AttemptsClaimedDeliveries(t *testing.T) {
 		Notifications: notifStore,
 		Deliveries:    delivStore,
 		PushSubs:      &fakePushSubs{},
-		SendEmail:     func(_ config.Config, _, _, _, _ string) error { return nil },
+		SendEmail:     func(_ config.Config, _, _, _, _ string, _ *channels.EmailAttachment) error { return nil },
 	}
 
 	QueueConsumer{Deps: deps}.pollOnce(context.Background())

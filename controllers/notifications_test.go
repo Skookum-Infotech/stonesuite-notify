@@ -29,10 +29,11 @@ const testJWTSecret = "test-secret"
 // fakeStore is an in-memory notifications.Store used to test handlers
 // without a real database.
 type fakeStore struct {
-	rows        []notifications.Notification
-	nextID      int
-	forceErr    error
-	notFoundErr bool
+	rows             []notifications.Notification
+	nextID           int
+	forceErr         error
+	notFoundErr      bool
+	savedAttachments map[string]notifications.AttachmentInput // keyed by notificationID
 }
 
 func (f *fakeStore) Create(_ context.Context, in notifications.CreateInput) (*notifications.Notification, error) {
@@ -150,6 +151,17 @@ func (f *fakeStore) MarkAllRead(_ context.Context, tenantID, recipientUserID str
 		}
 	}
 	return nil
+}
+
+func (f *fakeStore) SaveAttachment(_ context.Context, notificationID string, a notifications.AttachmentInput) error {
+	if f.savedAttachments == nil {
+		f.savedAttachments = map[string]notifications.AttachmentInput{}
+	}
+	f.savedAttachments[notificationID] = a
+	return nil
+}
+func (f *fakeStore) GetAttachment(_ context.Context, _, _ string) (*notifications.AttachmentInput, error) {
+	return nil, nil
 }
 
 func itoa(i int) string {
@@ -714,6 +726,64 @@ func deliveryLogFixture() *fakeDeliveriesStore {
 		{ID: "d3", NotificationID: "other-notification", TenantID: "t1", Channel: deliveries.ChannelEmail, Status: deliveries.StatusSent},
 		{ID: "d4", NotificationID: "n1", TenantID: "other-tenant", Channel: deliveries.ChannelEmail, Status: deliveries.StatusSent},
 	}}
+}
+
+func TestHandler_Create_WithAttachment_SavesIt(t *testing.T) {
+	store := &fakeStore{}
+	h := newTestHandler(store, newFakePreferencesStore(), &fakeDeliveriesStore{}, config.Config{})
+
+	body := `{
+		"tenantId": "t1",
+		"recipients": [{"userId": "u1", "email": "u1@example.com"}],
+		"eventType": "document.sent",
+		"resource": "invoice",
+		"resourceId": "inv-1",
+		"title": "Invoice INV-1 sent",
+		"channels": ["email"],
+		"attachment": {"fileName": "INV-1.pdf", "contentType": "application/pdf", "contentBase64": "JVBERi0xLjQ="}
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/api/notifications/internal", bytes.NewReader([]byte(body)))
+	rec := httptest.NewRecorder()
+	h.Create(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if len(store.savedAttachments) != 1 {
+		t.Fatalf("expected exactly 1 saved attachment, got %d", len(store.savedAttachments))
+	}
+	for _, a := range store.savedAttachments {
+		if a.FileName != "INV-1.pdf" {
+			t.Fatalf("expected fileName INV-1.pdf, got %q", a.FileName)
+		}
+		if string(a.Content) != "%PDF-1.4" {
+			t.Fatalf("expected decoded content %q, got %q", "%PDF-1.4", a.Content)
+		}
+	}
+}
+
+func TestHandler_Create_NoAttachment_SavesNothing(t *testing.T) {
+	store := &fakeStore{}
+	h := newTestHandler(store, newFakePreferencesStore(), &fakeDeliveriesStore{}, config.Config{})
+
+	body := `{
+		"tenantId": "t1",
+		"recipients": [{"userId": "u1"}],
+		"eventType": "document.sent",
+		"resource": "invoice",
+		"resourceId": "inv-1",
+		"title": "Invoice INV-1 sent"
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/api/notifications/internal", bytes.NewReader([]byte(body)))
+	rec := httptest.NewRecorder()
+	h.Create(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if len(store.savedAttachments) != 0 {
+		t.Fatalf("expected no saved attachments, got %d", len(store.savedAttachments))
+	}
 }
 
 func TestDeliveries_ReturnsLogForNotification(t *testing.T) {
