@@ -743,7 +743,8 @@ func TestHandler_Create_WithAttachment_SavesIt(t *testing.T) {
 		"attachment": {"fileName": "INV-1.pdf", "contentType": "application/pdf", "contentBase64": "JVBERi0xLjQ="}
 	}`
 	req := httptest.NewRequest(http.MethodPost, "/api/notifications/internal", bytes.NewReader([]byte(body)))
-	rec := serviceKeyRequest(t, req, []string{apikeys.ScopeMessagesCreate}, apikeys.ScopeMessagesCreate, h.Create)
+	rec := httptest.NewRecorder()
+	h.Create(rec, req)
 
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("expected 201, got %d: %s", rec.Code, rec.Body.String())
@@ -774,7 +775,8 @@ func TestHandler_Create_NoAttachment_SavesNothing(t *testing.T) {
 		"title": "Invoice INV-1 sent"
 	}`
 	req := httptest.NewRequest(http.MethodPost, "/api/notifications/internal", bytes.NewReader([]byte(body)))
-	rec := serviceKeyRequest(t, req, []string{apikeys.ScopeMessagesCreate}, apikeys.ScopeMessagesCreate, h.Create)
+	rec := httptest.NewRecorder()
+	h.Create(rec, req)
 
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("expected 201, got %d: %s", rec.Code, rec.Body.String())
