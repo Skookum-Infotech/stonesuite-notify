@@ -3,6 +3,7 @@ package controllers
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"log"
@@ -200,6 +201,15 @@ type recipientTarget struct {
 	Email  string `json:"email,omitempty"`
 }
 
+// attachmentInput is the wire shape of createNotificationRequest.Attachment
+// — content travels as base64 over JSON, decoded to bytes before building
+// notifications.AttachmentInput.
+type attachmentInput struct {
+	FileName      string `json:"fileName"`
+	ContentType   string `json:"contentType"`
+	ContentBase64 string `json:"contentBase64"`
+}
+
 // createNotificationRequest is the payload accepted by the internal create
 // endpoint. Multiple recipients let a caller fan a single business event
 // out to every user holding a role (role membership is resolved by the
@@ -217,6 +227,7 @@ type createNotificationRequest struct {
 	Body        string            `json:"body,omitempty"`
 	Link        string            `json:"link,omitempty"`
 	Channels    []string          `json:"channels,omitempty"`
+	Attachment  *attachmentInput  `json:"attachment,omitempty"`
 }
 
 const channelEmail = "email"
@@ -238,6 +249,20 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 	if len(req.Recipients) == 0 {
 		fail(w, http.StatusBadRequest, "recipients is required.")
 		return
+	}
+
+	var attachment *notifications.AttachmentInput
+	if req.Attachment != nil {
+		content, decErr := base64.StdEncoding.DecodeString(req.Attachment.ContentBase64)
+		if decErr != nil {
+			fail(w, http.StatusBadRequest, "attachment.contentBase64 is not valid base64.")
+			return
+		}
+		attachment = &notifications.AttachmentInput{
+			FileName:    req.Attachment.FileName,
+			ContentType: req.Attachment.ContentType,
+			Content:     content,
+		}
 	}
 
 	// Validate every recipient up front so a bad entry rejects the whole
@@ -290,6 +315,11 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		created = append(created, n)
+		if attachment != nil && wantsEmail && p.prefs.EmailEnabled {
+			if err := h.Store.SaveAttachment(r.Context(), n.ID, *attachment); err != nil {
+				log.Printf("notifications: save attachment for %s: %v", n.ID, err)
+			}
+		}
 		h.enqueueDeliveries(r.Context(), *n, p.prefs, wantsEmail)
 
 		// One entry per notification, not per request, so the trail can
