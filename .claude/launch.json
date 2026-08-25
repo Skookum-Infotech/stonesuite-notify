@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "stonesuite-notify",
+      "runtimeExecutable": "go",
+      "runtimeArgs": ["run", "."],
+      "port": 8090
+    }
+  ]
+}
