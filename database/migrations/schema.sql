@@ -148,7 +148,7 @@ CREATE INDEX IF NOT EXISTS idx_audit_tenant_action
     ON notification_audit_logs (tenant_id, action, created_at DESC);
 
 CREATE INDEX IF NOT EXISTS idx_audit_tenant_actor
-    ON notification_audit_logs (environment, tenant_id, actor_user_id, created_at DESC);
+    ON notification_audit_logs (tenant_id, actor_user_id, created_at DESC);
 
 -- Replaces the single global INTERNAL_SERVICE_SECRET (middleware/auth.go).
 -- Each row is one scoped, environment-bound credential: key_hash is
