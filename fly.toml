@@ -1,0 +1,42 @@
+# fly.toml app configuration file for stonesuite-notify
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+
+app            = "stonesuite-notify"
+primary_region = 'iad'
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PORT      = "8090"
+  # IMPORTANT: must match the deployed frontend's exact origin (protocol +
+  # host, no trailing slash) -- this service serves the in-app notification
+  # feed and push-subscription endpoints directly to the browser, same as
+  # StoneSuite-Backend's CORS_ORIGIN. A mismatch blocks all browser calls.
+  CORS_ORIGIN = "https://dev.stonesuite.app"
+  SMTP_PORT   = "587"
+
+[http_service]
+  internal_port = 8090
+  force_https = true
+  # Scale-to-zero, same rationale as StoneSuite-Backend's fly.toml: the
+  # workers/ ticker loops (QueueConsumer 2s, RetryWorker 15s) only run while
+  # a Machine is up, so a stopped Machine simply delays already-enqueued
+  # deliveries until the next request wakes it -- acceptable for this
+  # service's traffic pattern, and correct behavior resumes automatically.
+  auto_stop_machines = 'stop'
+  auto_start_machines = true
+  min_machines_running = 0
+  processes = ['app']
+  concurrency = { hard_limit = 250, soft_limit = 200, type = 'requests' }
+
+  # NO periodic health check on purpose -- see StoneSuite-Backend's fly.toml
+  # for why (a recurring check counts as traffic and defeats scale-to-zero).
+  # Liveness is exposed in-app at GET /healthz for an external uptime
+  # monitor to point at instead.
+
+[[vm]]
+  memory = '256mb'
+  cpu_kind = 'shared'
+  cpus = 1
