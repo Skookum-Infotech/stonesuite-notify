@@ -8,14 +8,14 @@ import (
 )
 
 func TestSendNotificationEmail_NoProviderConfigured_NoOp(t *testing.T) {
-	err := SendNotificationEmail(config.Config{}, "user@example.com", "title", "body", "", nil)
+	err := SendNotificationEmail(config.Config{}, "user@example.com", "title", "body", "", "", nil)
 	if err != nil {
 		t.Fatalf("expected no-op (nil error) when no provider is configured, got %v", err)
 	}
 }
 
 func TestSendNotificationEmail_MissingRecipient_ReturnsError(t *testing.T) {
-	err := SendNotificationEmail(config.Config{}, "", "title", "body", "", nil)
+	err := SendNotificationEmail(config.Config{}, "", "title", "body", "", "", nil)
 	if err == nil {
 		t.Fatal("expected an error for an empty recipient address")
 	}
@@ -36,7 +36,7 @@ func TestRenderEmailHTML_OmitsLinkWhenAbsent(t *testing.T) {
 }
 
 func TestSendNotificationEmail_NoAttachment_StillNoOp(t *testing.T) {
-	err := SendNotificationEmail(config.Config{}, "user@example.com", "title", "body", "", nil)
+	err := SendNotificationEmail(config.Config{}, "user@example.com", "title", "body", "", "", nil)
 	if err != nil {
 		t.Fatalf("expected no-op (nil error) when no provider is configured, got %v", err)
 	}
@@ -54,6 +54,18 @@ func TestBuildSMTPMessage_IncludesAttachment(t *testing.T) {
 	}
 	if !strings.Contains(s, "JVBERi0xLjQ") {
 		t.Fatalf("expected base64-encoded attachment content in the message, got:\n%s", s)
+	}
+}
+
+func TestBuildSMTPMessage_UsesGivenHTMLVerbatim(t *testing.T) {
+	brandedHTML := `<html><body><p>Please find your invoice attached.</p><p>Regards,<br>Acme</p></body></html>`
+	msg := buildSMTPMessage("user@example.com", "from@example.com", "Invoice INV-1", brandedHTML, nil)
+	s := string(msg)
+	if !strings.Contains(s, "Please find your invoice attached.") {
+		t.Fatalf("expected the branded HTML body verbatim, got:\n%s", s)
+	}
+	if strings.Contains(s, "<h2>Invoice INV-1</h2>") {
+		t.Fatalf("expected the generic <h2>title</h2> template NOT to be used when explicit HTML is given, got:\n%s", s)
 	}
 }
 

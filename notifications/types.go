@@ -46,13 +46,16 @@ type CreateInput struct {
 	VisibleInApp    bool   `json:"visibleInApp"`
 }
 
-// AttachmentInput is the optional single file attached to a notification's
-// email delivery. Persisted in notification_attachments, not on the
-// notification row itself — see that table's doc comment in schema.sql.
+// AttachmentInput is the optional per-notification content only the email
+// delivery worker reads: an attached file, custom HTML to use in place of
+// the generic template, or both. Persisted in notification_attachments, not
+// on the notification row itself — see that table's doc comment in
+// schema.sql.
 type AttachmentInput struct {
-	FileName    string
-	ContentType string
-	Content     []byte
+	FileName      string
+	ContentType   string
+	Content       []byte
+	EmailBodyHTML string
 }
 
 // Paging bounds for the feed. DefaultPageSize matches what the bell
@@ -81,8 +84,8 @@ func (in CreateInput) Validate() error {
 	switch {
 	case in.TenantID == "":
 		return errRequired("tenantId")
-	case in.RecipientUserID == "":
-		return errRequired("recipientUserId")
+	case in.RecipientUserID == "" && in.RecipientEmail == "":
+		return errRequired("recipientUserId or recipientEmail")
 	case in.EventType == "":
 		return errRequired("eventType")
 	case in.Resource == "":

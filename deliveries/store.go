@@ -54,13 +54,17 @@ const deliveryColumns = `id, notification_id, tenant_id, recipient_user_id, chan
 
 func scanDelivery(row pgx.Row) (*Delivery, error) {
 	var d Delivery
+	var recipientUserID *string
 	var lastError *string
 	if err := row.Scan(
-		&d.ID, &d.NotificationID, &d.TenantID, &d.RecipientUserID, &d.Channel, &d.Status,
+		&d.ID, &d.NotificationID, &d.TenantID, &recipientUserID, &d.Channel, &d.Status,
 		&d.Attempts, &d.MaxAttempts, &d.NextAttemptAt, &lastError, &d.ProviderResponse,
 		&d.CreatedAt, &d.UpdatedAt,
 	); err != nil {
 		return nil, err
+	}
+	if recipientUserID != nil {
+		d.RecipientUserID = *recipientUserID
 	}
 	if lastError != nil {
 		d.LastError = *lastError
@@ -70,11 +74,16 @@ func scanDelivery(row pgx.Row) (*Delivery, error) {
 
 // Enqueue inserts one delivery row.
 func (s *PGStore) Enqueue(ctx context.Context, notificationID, tenantID, recipientUserID, channel, status string) (*Delivery, error) {
+	var recipientUserIDArg any
+	if recipientUserID != "" {
+		recipientUserIDArg = recipientUserID
+	}
+
 	row := s.pool.QueryRow(ctx, `
 		INSERT INTO notification_deliveries (notification_id, tenant_id, recipient_user_id, channel, status)
 		VALUES ($1, $2, $3, $4, $5)
 		RETURNING `+deliveryColumns,
-		notificationID, tenantID, recipientUserID, channel, status)
+		notificationID, tenantID, recipientUserIDArg, channel, status)
 
 	d, err := scanDelivery(row)
 	if err != nil {

@@ -24,7 +24,7 @@ func TestCreateInputValidate(t *testing.T) {
 		wantErr string
 	}{
 		{"missing tenantId", func(in *CreateInput) { in.TenantID = "" }, "tenantId is required"},
-		{"missing recipientUserId", func(in *CreateInput) { in.RecipientUserID = "" }, "recipientUserId is required"},
+		{"missing both recipientUserId and recipientEmail", func(in *CreateInput) { in.RecipientUserID = "" }, "recipientUserId or recipientEmail is required"},
 		{"missing eventType", func(in *CreateInput) { in.EventType = "" }, "eventType is required"},
 		{"missing resource", func(in *CreateInput) { in.Resource = "" }, "resource is required"},
 		{"missing resourceId", func(in *CreateInput) { in.ResourceID = "" }, "resourceId is required"},
@@ -43,5 +43,19 @@ func TestCreateInputValidate(t *testing.T) {
 				t.Fatalf("got error %q, want %q", err.Error(), tc.wantErr)
 			}
 		})
+	}
+}
+
+func TestCreateInputValidate_RecipientEmailAloneIsSufficient(t *testing.T) {
+	in := CreateInput{
+		TenantID:       "tenant-1",
+		RecipientEmail: "customer@example.com",
+		EventType:      "document.sent",
+		Resource:       "salesorder",
+		ResourceID:     "so-1",
+		Title:          "Sales Order SO-1 sent",
+	}
+	if err := in.Validate(); err != nil {
+		t.Fatalf("expected no error for an email-only recipient, got %v", err)
 	}
 }
