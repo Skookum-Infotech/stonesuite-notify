@@ -227,7 +227,11 @@ type createNotificationRequest struct {
 	Body        string            `json:"body,omitempty"`
 	Link        string            `json:"link,omitempty"`
 	Channels    []string          `json:"channels,omitempty"`
-	Attachment  *attachmentInput  `json:"attachment,omitempty"`
+	// EmailBodyHTML, when set, is used verbatim as the email's HTML body
+	// instead of the generic <h2>title</h2><p>body</p> template — see
+	// channels.SendNotificationEmail.
+	EmailBodyHTML string           `json:"emailBodyHtml,omitempty"`
+	Attachment    *attachmentInput `json:"attachment,omitempty"`
 }
 
 const channelEmail = "email"
@@ -252,16 +256,17 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var attachment *notifications.AttachmentInput
-	if req.Attachment != nil {
-		content, decErr := base64.StdEncoding.DecodeString(req.Attachment.ContentBase64)
-		if decErr != nil {
-			fail(w, http.StatusBadRequest, "attachment.contentBase64 is not valid base64.")
-			return
-		}
-		attachment = &notifications.AttachmentInput{
-			FileName:    req.Attachment.FileName,
-			ContentType: req.Attachment.ContentType,
-			Content:     content,
+	if req.Attachment != nil || req.EmailBodyHTML != "" {
+		attachment = &notifications.AttachmentInput{EmailBodyHTML: req.EmailBodyHTML}
+		if req.Attachment != nil {
+			content, decErr := base64.StdEncoding.DecodeString(req.Attachment.ContentBase64)
+			if decErr != nil {
+				fail(w, http.StatusBadRequest, "attachment.contentBase64 is not valid base64.")
+				return
+			}
+			attachment.FileName = req.Attachment.FileName
+			attachment.ContentType = req.Attachment.ContentType
+			attachment.Content = content
 		}
 	}
 
@@ -293,12 +298,23 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		prefs, err := h.PreferenceStore.Resolve(r.Context(), req.TenantID, recipient.UserID)
-		if err != nil {
-			// Fail open: an outage in the preferences table must never
-			// block the in-app row, which remains the source of truth.
-			log.Printf("notifications: resolve preferences for %s: %v", recipient.UserID, err)
-			prefs = preferences.Preferences{EmailEnabled: true, InAppEnabled: true, PushEnabled: true}
+		var prefs preferences.Preferences
+		if recipient.UserID == "" {
+			// No StoneSuite account to resolve tenant/user preference
+			// overrides against — an external recipient always gets
+			// email (the only channel they can receive), never in-app
+			// (no bell to show it in) or push (no device subscription
+			// possible without a user).
+			prefs = preferences.Preferences{EmailEnabled: true, InAppEnabled: false, PushEnabled: false}
+		} else {
+			var err error
+			prefs, err = h.PreferenceStore.Resolve(r.Context(), req.TenantID, recipient.UserID)
+			if err != nil {
+				// Fail open: an outage in the preferences table must never
+				// block the in-app row, which remains the source of truth.
+				log.Printf("notifications: resolve preferences for %s: %v", recipient.UserID, err)
+				prefs = preferences.Preferences{EmailEnabled: true, InAppEnabled: true, PushEnabled: true}
+			}
 		}
 		in.VisibleInApp = prefs.InAppEnabled
 
@@ -336,6 +352,7 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 			ResourceID:  n.ID,
 			Metadata: audit.Metadata(map[string]any{
 				"recipientUserId": n.RecipientUserID,
+				"recipientEmail":  n.RecipientEmail,
 				"eventType":       n.EventType,
 				"resource":        n.Resource,
 				"resourceId":      n.ResourceID,
