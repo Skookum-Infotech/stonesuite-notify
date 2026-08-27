@@ -81,8 +81,8 @@ func (in CreateInput) Validate() error {
 	switch {
 	case in.TenantID == "":
 		return errRequired("tenantId")
-	case in.RecipientUserID == "":
-		return errRequired("recipientUserId")
+	case in.RecipientUserID == "" && in.RecipientEmail == "":
+		return errRequired("recipientUserId or recipientEmail")
 	case in.EventType == "":
 		return errRequired("eventType")
 	case in.Resource == "":
