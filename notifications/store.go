@@ -58,13 +58,17 @@ const notificationColumns = `id, tenant_id, recipient_user_id, recipient_email, 
 
 func scanNotification(row pgx.Row) (*Notification, error) {
 	var n Notification
+	var recipientUserID *string
 	var actorUserID *string
 	if err := row.Scan(
-		&n.ID, &n.TenantID, &n.RecipientUserID, &n.RecipientEmail, &actorUserID,
+		&n.ID, &n.TenantID, &recipientUserID, &n.RecipientEmail, &actorUserID,
 		&n.EventType, &n.Resource, &n.ResourceID, &n.Title, &n.Body, &n.Link, &n.VisibleInApp,
 		&n.ReadAt, &n.CreatedAt,
 	); err != nil {
 		return nil, err
+	}
+	if recipientUserID != nil {
+		n.RecipientUserID = *recipientUserID
 	}
 	if actorUserID != nil {
 		n.ActorUserID = *actorUserID
@@ -81,13 +85,17 @@ func (s *PGStore) Create(ctx context.Context, in CreateInput) (*Notification, er
 	if in.ActorUserID != "" {
 		actorUserIDArg = in.ActorUserID
 	}
+	var recipientUserIDArg any
+	if in.RecipientUserID != "" {
+		recipientUserIDArg = in.RecipientUserID
+	}
 
 	row := s.pool.QueryRow(ctx, `
 		INSERT INTO notifications
 			(tenant_id, recipient_user_id, recipient_email, actor_user_id, event_type, resource, resource_id, title, body, link, visible_in_app)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 		RETURNING `+notificationColumns,
-		in.TenantID, in.RecipientUserID, in.RecipientEmail, actorUserIDArg, in.EventType, in.Resource, in.ResourceID, in.Title, in.Body, in.Link, in.VisibleInApp)
+		in.TenantID, recipientUserIDArg, in.RecipientEmail, actorUserIDArg, in.EventType, in.Resource, in.ResourceID, in.Title, in.Body, in.Link, in.VisibleInApp)
 
 	n, err := scanNotification(row)
 	if err != nil {
@@ -208,16 +216,23 @@ func (s *PGStore) MarkAllRead(ctx context.Context, tenantID, recipientUserID str
 }
 
 // SaveAttachment inserts (or replaces, on the rare case of a retry)
-// notification_id's attachment row.
+// notification_id's attachment row. content defaults to an empty (not
+// NULL) byte slice when only a.EmailBodyHTML is set and there is no actual
+// file, since the column is NOT NULL.
 func (s *PGStore) SaveAttachment(ctx context.Context, notificationID string, a AttachmentInput) error {
+	content := a.Content
+	if content == nil {
+		content = []byte{}
+	}
 	_, err := s.pool.Exec(ctx, `
-		INSERT INTO notification_attachments (notification_id, file_name, content_type, content)
-		VALUES ($1, $2, $3, $4)
+		INSERT INTO notification_attachments (notification_id, file_name, content_type, content, email_body_html)
+		VALUES ($1, $2, $3, $4, $5)
 		ON CONFLICT (notification_id) DO UPDATE
 			SET file_name = EXCLUDED.file_name,
 			    content_type = EXCLUDED.content_type,
-			    content = EXCLUDED.content`,
-		notificationID, a.FileName, a.ContentType, a.Content)
+			    content = EXCLUDED.content,
+			    email_body_html = EXCLUDED.email_body_html`,
+		notificationID, a.FileName, a.ContentType, content, a.EmailBodyHTML)
 	if err != nil {
 		return fmt.Errorf("save notification attachment %s: %w", notificationID, err)
 	}
@@ -232,11 +247,11 @@ func (s *PGStore) SaveAttachment(ctx context.Context, notificationID string, a A
 func (s *PGStore) GetAttachment(ctx context.Context, tenantID, notificationID string) (*AttachmentInput, error) {
 	var a AttachmentInput
 	err := s.pool.QueryRow(ctx, `
-		SELECT na.file_name, na.content_type, na.content
+		SELECT na.file_name, na.content_type, na.content, na.email_body_html
 		FROM notification_attachments na
 		JOIN notifications n ON n.id = na.notification_id
 		WHERE na.notification_id = $1 AND n.tenant_id = $2`,
-		notificationID, tenantID).Scan(&a.FileName, &a.ContentType, &a.Content)
+		notificationID, tenantID).Scan(&a.FileName, &a.ContentType, &a.Content, &a.EmailBodyHTML)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
