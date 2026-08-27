@@ -36,15 +36,21 @@ type EmailAttachment struct {
 // SendNotificationEmail delivers a notification over email, choosing a
 // provider the same way StoneSuite-Backend's services/email.go does:
 // Resend if configured, else SMTP, else a logged no-op. attachment is
-// optional (nil for the overwhelming majority of notifications). Errors are
-// returned for logging by the caller but are never fatal to the caller's
-// own request.
-func SendNotificationEmail(cfg config.Config, to, title, body, link string, attachment *EmailAttachment) error {
+// optional (nil for the overwhelming majority of notifications). When
+// emailBodyHTML is non-empty, it is used verbatim as the message body
+// instead of the generic <h2>title</h2><p>body</p> template — used by
+// callers (e.g. a document-send customer email) that need their own
+// branding. Errors are returned for logging by the caller but are never
+// fatal to the caller's own request.
+func SendNotificationEmail(cfg config.Config, to, title, body, link, emailBodyHTML string, attachment *EmailAttachment) error {
 	if to == "" {
 		return fmt.Errorf("email channel: recipient address is empty")
 	}
 
-	html := renderEmailHTML(title, body, link)
+	html := emailBodyHTML
+	if html == "" {
+		html = renderEmailHTML(title, body, link)
+	}
 
 	switch {
 	case cfg.ResendAPIKey != "":

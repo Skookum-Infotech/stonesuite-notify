@@ -176,6 +176,7 @@ type fakePreferencesStore struct {
 	resolved             preferences.Preferences
 	tenantDefaults       preferences.Preferences
 	resolveErr           error
+	resolveCalls         int
 	lastOverride         preferences.OverrideInput
 	lastTenantDefaults   preferences.TenantDefaultsInput
 	lastTenantDefaultsID string
@@ -187,6 +188,7 @@ func newFakePreferencesStore() *fakePreferencesStore {
 }
 
 func (f *fakePreferencesStore) Resolve(_ context.Context, _, _ string) (preferences.Preferences, error) {
+	f.resolveCalls++
 	if f.resolveErr != nil {
 		return preferences.Preferences{}, f.resolveErr
 	}
@@ -521,13 +523,13 @@ func TestCreate_MultipleRecipients_CreatesOneRowEach(t *testing.T) {
 	}
 }
 
-func TestCreate_RejectsRecipientMissingUserID(t *testing.T) {
+func TestCreate_RejectsRecipientMissingBothUserIDAndEmail(t *testing.T) {
 	store := &fakeStore{}
 	h := newTestHandler(store, newFakePreferencesStore(), &fakeDeliveriesStore{}, config.Config{})
 
 	body, _ := json.Marshal(createNotificationRequest{
 		TenantID:   "t1",
-		Recipients: []recipientTarget{{Email: "no-id@example.com"}},
+		Recipients: []recipientTarget{{}},
 		EventType:  "quote.sent",
 		Resource:   "quote",
 		ResourceID: "q-1",
@@ -543,6 +545,128 @@ func TestCreate_RejectsRecipientMissingUserID(t *testing.T) {
 	}
 	if len(store.rows) != 0 {
 		t.Fatalf("store has %d rows, want 0 (invalid recipient must reject whole request)", len(store.rows))
+	}
+}
+
+func TestCreate_AcceptsRecipientWithEmailOnly(t *testing.T) {
+	store := &fakeStore{}
+	delivStore := &fakeDeliveriesStore{}
+	h := newTestHandler(store, newFakePreferencesStore(), delivStore, config.Config{})
+
+	body, _ := json.Marshal(createNotificationRequest{
+		TenantID:   "t1",
+		Recipients: []recipientTarget{{Email: "customer@example.com"}},
+		EventType:  "document.sent",
+		Resource:   "salesorder",
+		ResourceID: "so-1",
+		Title:      "Sales Order SO-1 sent",
+		Channels:   []string{"email"},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/notifications/internal", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+
+	h.Create(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body: %s)", rec.Code, rec.Body.String())
+	}
+	if len(store.rows) != 1 {
+		t.Fatalf("store has %d rows, want 1", len(store.rows))
+	}
+	n := store.rows[0]
+	if n.RecipientUserID != "" {
+		t.Fatalf("RecipientUserID = %q, want empty for an email-only recipient", n.RecipientUserID)
+	}
+	if n.RecipientEmail != "customer@example.com" {
+		t.Fatalf("RecipientEmail = %q, want customer@example.com", n.RecipientEmail)
+	}
+	if n.VisibleInApp {
+		t.Fatalf("VisibleInApp = true, want false (no user to show a bell to)")
+	}
+	emailDelivery, ok := delivStore.find(deliveries.ChannelEmail)
+	if !ok {
+		t.Fatalf("no email delivery row enqueued for the email-only recipient")
+	}
+	if emailDelivery.Status != deliveries.StatusPending {
+		t.Fatalf("email delivery status = %q, want %q", emailDelivery.Status, deliveries.StatusPending)
+	}
+}
+
+func TestCreate_EmailOnlyRecipient_SkipsPreferenceResolve(t *testing.T) {
+	store := &fakeStore{}
+	prefs := newFakePreferencesStore()
+	h := newTestHandler(store, prefs, &fakeDeliveriesStore{}, config.Config{})
+
+	body, _ := json.Marshal(createNotificationRequest{
+		TenantID:   "t1",
+		Recipients: []recipientTarget{{Email: "customer@example.com"}},
+		EventType:  "document.sent",
+		Resource:   "salesorder",
+		ResourceID: "so-1",
+		Title:      "Sales Order SO-1 sent",
+		Channels:   []string{"email"},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/notifications/internal", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+
+	h.Create(rec, req)
+
+	if prefs.resolveCalls != 0 {
+		t.Fatalf("PreferenceStore.Resolve was called %d times for an email-only recipient, want 0", prefs.resolveCalls)
+	}
+}
+
+func TestCreate_UserRecipient_StillResolvesPreferences(t *testing.T) {
+	store := &fakeStore{}
+	prefs := newFakePreferencesStore()
+	h := newTestHandler(store, prefs, &fakeDeliveriesStore{}, config.Config{})
+
+	body, _ := json.Marshal(createNotificationRequest{
+		TenantID:   "t1",
+		Recipients: []recipientTarget{{UserID: "u1"}},
+		EventType:  "invoice.approved",
+		Resource:   "invoice",
+		ResourceID: "inv-1",
+		Title:      "Invoice INV-1042 approved",
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/notifications/internal", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+
+	h.Create(rec, req)
+
+	if prefs.resolveCalls != 1 {
+		t.Fatalf("PreferenceStore.Resolve was called %d times for a real user, want 1", prefs.resolveCalls)
+	}
+}
+
+func TestCreate_EmailBodyHTML_PersistedAsAttachment(t *testing.T) {
+	store := &fakeStore{}
+	h := newTestHandler(store, newFakePreferencesStore(), &fakeDeliveriesStore{}, config.Config{})
+
+	body, _ := json.Marshal(createNotificationRequest{
+		TenantID:      "t1",
+		Recipients:    []recipientTarget{{Email: "customer@example.com"}},
+		EventType:     "document.sent",
+		Resource:      "salesorder",
+		ResourceID:    "so-1",
+		Title:         "Sales Order SO-1 sent",
+		Channels:      []string{"email"},
+		EmailBodyHTML: "<p>Branded body.</p>",
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/notifications/internal", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+
+	h.Create(rec, req)
+
+	if len(store.rows) != 1 {
+		t.Fatalf("store has %d rows, want 1", len(store.rows))
+	}
+	saved, ok := store.savedAttachments[store.rows[0].ID]
+	if !ok {
+		t.Fatalf("no attachment saved for notification %s", store.rows[0].ID)
+	}
+	if saved.EmailBodyHTML != "<p>Branded body.</p>" {
+		t.Fatalf("saved EmailBodyHTML = %q, want %q", saved.EmailBodyHTML, "<p>Branded body.</p>")
 	}
 }
 

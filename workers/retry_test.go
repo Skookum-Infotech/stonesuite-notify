@@ -34,7 +34,7 @@ func TestRetryWorker_PollOnce_AttemptsClaimedDeliveries(t *testing.T) {
 		Notifications: notifStore,
 		Deliveries:    delivStore,
 		PushSubs:      &fakePushSubs{},
-		SendEmail:     func(_ config.Config, _, _, _, _ string, _ *channels.EmailAttachment) error { return nil },
+		SendEmail:     func(_ config.Config, _, _, _, _, _ string, _ *channels.EmailAttachment) error { return nil },
 	}
 
 	RetryWorker{Deps: deps}.pollOnce(context.Background())
@@ -53,7 +53,7 @@ func TestRetryWorker_PollOnce_RepeatedFailure_IncrementsFromPriorAttempts(t *tes
 		Notifications: notifStore,
 		Deliveries:    delivStore,
 		PushSubs:      &fakePushSubs{},
-		SendEmail: func(_ config.Config, _, _, _, _ string, _ *channels.EmailAttachment) error {
+		SendEmail: func(_ config.Config, _, _, _, _, _ string, _ *channels.EmailAttachment) error {
 			return context.DeadlineExceeded
 		},
 	}

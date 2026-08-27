@@ -121,7 +121,7 @@ func TestAttemptDelivery_Email_Success_MarksSent(t *testing.T) {
 		Notifications: notifStore,
 		Deliveries:    delivStore,
 		PushSubs:      &fakePushSubs{},
-		SendEmail:     func(_ config.Config, _, _, _, _ string, _ *channels.EmailAttachment) error { return nil },
+		SendEmail:     func(_ config.Config, _, _, _, _, _ string, _ *channels.EmailAttachment) error { return nil },
 	}
 
 	d := deliveries.Delivery{ID: "d1", NotificationID: "n1", TenantID: "t1", RecipientUserID: "u1", Channel: deliveries.ChannelEmail}
@@ -139,7 +139,7 @@ func TestAttemptDelivery_Email_Failure_MarksRetryingWithIncrementedAttempts(t *t
 		Notifications: notifStore,
 		Deliveries:    delivStore,
 		PushSubs:      &fakePushSubs{},
-		SendEmail: func(_ config.Config, _, _, _, _ string, _ *channels.EmailAttachment) error {
+		SendEmail: func(_ config.Config, _, _, _, _, _ string, _ *channels.EmailAttachment) error {
 			return errors.New("smtp down")
 		},
 	}
@@ -332,7 +332,7 @@ func TestAttemptDelivery_Email_Success_AuditsSent(t *testing.T) {
 		Deliveries:    &fakeDeliveries{},
 		PushSubs:      &fakePushSubs{},
 		Audit:         recorder,
-		SendEmail:     func(_ config.Config, _, _, _, _ string, _ *channels.EmailAttachment) error { return nil },
+		SendEmail:     func(_ config.Config, _, _, _, _, _ string, _ *channels.EmailAttachment) error { return nil },
 	}
 
 	d := deliveries.Delivery{ID: "d1", NotificationID: "n1", TenantID: "t1", RecipientUserID: "u1", Channel: deliveries.ChannelEmail}
@@ -359,7 +359,7 @@ func TestAttemptDelivery_RetryableFailure_RecordsNoAuditEntry(t *testing.T) {
 		Deliveries:    &fakeDeliveries{},
 		PushSubs:      &fakePushSubs{},
 		Audit:         recorder,
-		SendEmail: func(_ config.Config, _, _, _, _ string, _ *channels.EmailAttachment) error {
+		SendEmail: func(_ config.Config, _, _, _, _, _ string, _ *channels.EmailAttachment) error {
 			return errors.New("smtp down")
 		},
 	}
@@ -379,7 +379,7 @@ func TestAttemptDelivery_FinalFailure_AuditsFailed(t *testing.T) {
 		Deliveries:    &fakeDeliveries{},
 		PushSubs:      &fakePushSubs{},
 		Audit:         recorder,
-		SendEmail: func(_ config.Config, _, _, _, _ string, _ *channels.EmailAttachment) error {
+		SendEmail: func(_ config.Config, _, _, _, _, _ string, _ *channels.EmailAttachment) error {
 			return errors.New("smtp down")
 		},
 	}
@@ -407,7 +407,7 @@ func TestAttemptDelivery_NilRecorder_DoesNotPanic(t *testing.T) {
 		Notifications: &fakeNotifications{byID: map[string]notifications.Notification{"n1": testNotification("n1")}},
 		Deliveries:    &fakeDeliveries{},
 		PushSubs:      &fakePushSubs{},
-		SendEmail:     func(_ config.Config, _, _, _, _ string, _ *channels.EmailAttachment) error { return nil },
+		SendEmail:     func(_ config.Config, _, _, _, _, _ string, _ *channels.EmailAttachment) error { return nil },
 	}
 
 	d := deliveries.Delivery{ID: "d1", NotificationID: "n1", TenantID: "t1", RecipientUserID: "u1", Channel: deliveries.ChannelEmail}
@@ -431,7 +431,7 @@ func TestAttemptEmail_WithAttachment_PassesItToSendEmail(t *testing.T) {
 		Deliveries:    deliveryStore,
 		Audit:         nil,
 		Config:        config.Config{},
-		SendEmail: func(_ config.Config, _, _, _, _ string, attachment *channels.EmailAttachment) error {
+		SendEmail: func(_ config.Config, _, _, _, _, _ string, attachment *channels.EmailAttachment) error {
 			gotAttachment = attachment
 			return nil
 		},
@@ -452,6 +452,42 @@ func TestAttemptEmail_WithAttachment_PassesItToSendEmail(t *testing.T) {
 	}
 }
 
+func TestAttemptEmail_PassesEmailBodyHTMLFromAttachment(t *testing.T) {
+	n := notifications.Notification{
+		ID: "n-3", TenantID: "t-1",
+		RecipientEmail: "customer@example.com", Title: "Sales Order SO-1", Body: "Document sent.",
+	}
+	notifStore := &fakeNotifications{
+		byID:        map[string]notifications.Notification{"n-3": n},
+		attachments: map[string]notifications.AttachmentInput{"n-3": {EmailBodyHTML: "<p>Branded body.</p>"}},
+	}
+	deliveryStore := &fakeDeliveries{}
+
+	var gotEmailBodyHTML string
+	var gotAttachment *channels.EmailAttachment
+	deps := Deps{
+		Notifications: notifStore,
+		Deliveries:    deliveryStore,
+		Config:        config.Config{},
+		SendEmail: func(_ config.Config, _, _, _, _, emailBodyHTML string, attachment *channels.EmailAttachment) error {
+			gotEmailBodyHTML = emailBodyHTML
+			gotAttachment = attachment
+			return nil
+		},
+	}
+
+	attemptDelivery(context.Background(), deps, deliveries.Delivery{
+		ID: "d-3", NotificationID: "n-3", Channel: deliveries.ChannelEmail,
+	})
+
+	if gotEmailBodyHTML != "<p>Branded body.</p>" {
+		t.Fatalf("emailBodyHTML = %q, want %q", gotEmailBodyHTML, "<p>Branded body.</p>")
+	}
+	if gotAttachment != nil {
+		t.Fatalf("expected no file attachment (attachment row has no FileName), got %+v", gotAttachment)
+	}
+}
+
 func TestAttemptEmail_NoAttachment_PassesNil(t *testing.T) {
 	n := notifications.Notification{ID: "n-2", TenantID: "t-1", RecipientEmail: "user@example.com"}
 	notifStore := &fakeNotifications{byID: map[string]notifications.Notification{"n-2": n}}
@@ -463,7 +499,7 @@ func TestAttemptEmail_NoAttachment_PassesNil(t *testing.T) {
 		Notifications: notifStore,
 		Deliveries:    deliveryStore,
 		Config:        config.Config{},
-		SendEmail: func(_ config.Config, _, _, _, _ string, attachment *channels.EmailAttachment) error {
+		SendEmail: func(_ config.Config, _, _, _, _, _ string, attachment *channels.EmailAttachment) error {
 			called = true
 			gotAttachment = attachment
 			return nil
