@@ -192,3 +192,29 @@ CREATE TABLE IF NOT EXISTS notification_attachments (
     content          BYTEA NOT NULL,
     created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- Email-only recipients (no StoneSuite users.id) — added so a notification
+-- can address someone with no account yet (e.g. a document-send customer
+-- email), routing that email through this service's queue/retry/audit
+-- layer instead of a direct Resend/SMTP call from the caller. Existing
+-- internal-recipient rows are unaffected: this only widens what the column
+-- allows, nothing narrows it.
+ALTER TABLE notifications ALTER COLUMN recipient_user_id DROP NOT NULL;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'notifications_recipient_identified'
+    ) THEN
+        ALTER TABLE notifications ADD CONSTRAINT notifications_recipient_identified
+            CHECK (recipient_user_id IS NOT NULL OR recipient_email <> '');
+    END IF;
+END $$;
+
+ALTER TABLE notification_deliveries ALTER COLUMN recipient_user_id DROP NOT NULL;
+
+-- Optional per-notification override of the generic email template
+-- (<h2>title</h2><p>body</p>), used when a caller needs its own branded
+-- HTML — e.g. the document-send customer email. Empty string means "use
+-- the generic template"; see channels.SendNotificationEmail.
+ALTER TABLE notification_attachments ADD COLUMN IF NOT EXISTS email_body_html TEXT NOT NULL DEFAULT '';
