@@ -201,9 +201,9 @@ type recipientTarget struct {
 	Email  string `json:"email,omitempty"`
 }
 
-// attachmentInput is the wire shape of createNotificationRequest.Attachment
-// — content travels as base64 over JSON, decoded to bytes before building
-// notifications.AttachmentInput.
+// attachmentInput is the wire shape of one entry in
+// createNotificationRequest.Attachments — content travels as base64 over
+// JSON, decoded to bytes before building notifications.AttachmentInput.
 type attachmentInput struct {
 	FileName      string `json:"fileName"`
 	ContentType   string `json:"contentType"`
@@ -230,8 +230,12 @@ type createNotificationRequest struct {
 	// EmailBodyHTML, when set, is used verbatim as the email's HTML body
 	// instead of the generic <h2>title</h2><p>body</p> template — see
 	// channels.SendNotificationEmail.
-	EmailBodyHTML string           `json:"emailBodyHtml,omitempty"`
-	Attachment    *attachmentInput `json:"attachment,omitempty"`
+	EmailBodyHTML string `json:"emailBodyHtml,omitempty"`
+	// Attachments matches StoneSuite-Backend's services.NotificationRequest
+	// wire shape (a plural array under "attachments") — only the first entry
+	// is used, since a notification carries at most one file today
+	// (notification_attachments is one row per notification_id).
+	Attachments []attachmentInput `json:"attachments,omitempty"`
 }
 
 const channelEmail = "email"
@@ -256,16 +260,17 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var attachment *notifications.AttachmentInput
-	if req.Attachment != nil || req.EmailBodyHTML != "" {
+	if len(req.Attachments) > 0 || req.EmailBodyHTML != "" {
 		attachment = &notifications.AttachmentInput{EmailBodyHTML: req.EmailBodyHTML}
-		if req.Attachment != nil {
-			content, decErr := base64.StdEncoding.DecodeString(req.Attachment.ContentBase64)
+		if len(req.Attachments) > 0 {
+			a := req.Attachments[0]
+			content, decErr := base64.StdEncoding.DecodeString(a.ContentBase64)
 			if decErr != nil {
-				fail(w, http.StatusBadRequest, "attachment.contentBase64 is not valid base64.")
+				fail(w, http.StatusBadRequest, "attachments[0].contentBase64 is not valid base64.")
 				return
 			}
-			attachment.FileName = req.Attachment.FileName
-			attachment.ContentType = req.Attachment.ContentType
+			attachment.FileName = a.FileName
+			attachment.ContentType = a.ContentType
 			attachment.Content = content
 		}
 	}
