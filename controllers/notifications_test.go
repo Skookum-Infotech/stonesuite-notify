@@ -864,7 +864,7 @@ func TestHandler_Create_WithAttachment_SavesIt(t *testing.T) {
 		"resourceId": "inv-1",
 		"title": "Invoice INV-1 sent",
 		"channels": ["email"],
-		"attachment": {"fileName": "INV-1.pdf", "contentType": "application/pdf", "contentBase64": "JVBERi0xLjQ="}
+		"attachments": [{"fileName": "INV-1.pdf", "contentType": "application/pdf", "contentBase64": "JVBERi0xLjQ="}]
 	}`
 	req := httptest.NewRequest(http.MethodPost, "/api/notifications/internal", bytes.NewReader([]byte(body)))
 	rec := httptest.NewRecorder()
