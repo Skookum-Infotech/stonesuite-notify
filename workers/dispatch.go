@@ -193,6 +193,12 @@ func markFailedAttempt(ctx context.Context, deps Deps, d deliveries.Delivery, la
 		log.Printf("workers: mark delivery %s retrying: %v", d.ID, err)
 	}
 	if attempts >= deliveries.MaxAttempts {
+		// A stable, greppable line for an ops log alert (Fly/Axiom): a
+		// delivery has exhausted its retries and will never be sent. The
+		// audit row below is the durable record; this is the active signal,
+		// since nothing polls the audit trail.
+		log.Printf("workers: event=delivery_permanently_failed delivery_id=%s notification_id=%s tenant_id=%s channel=%s recipient_user_id=%s attempts=%d last_error=%q",
+			d.ID, d.NotificationID, d.TenantID, d.Channel, d.RecipientUserID, attempts, lastError)
 		recordOutcome(ctx, deps, d, audit.ActionDeliveryFailed, map[string]any{"lastError": lastError})
 	}
 }

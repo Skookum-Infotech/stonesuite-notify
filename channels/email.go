@@ -39,13 +39,16 @@ type EmailAttachment struct {
 
 // SendNotificationEmail delivers a notification over email, choosing a
 // provider the same way StoneSuite-Backend's services/email.go does:
-// Resend if configured, else SMTP, else a logged no-op. attachment is
-// optional (nil for the overwhelming majority of notifications). When
-// emailBodyHTML is non-empty, it is used verbatim as the message body
-// instead of the generic <h2>title</h2><p>body</p> template — used by
-// callers (e.g. a document-send customer email) that need their own
-// branding. Errors are returned for logging by the caller but are never
-// fatal to the caller's own request.
+// Resend if configured, else SMTP. A missing provider or a missing
+// EMAIL_FROM returns an error (the delivery then retries and goes
+// terminal with a reason) rather than a silent no-op, since a delivery
+// row only reaches this function when email was actually requested.
+// attachment is optional (nil for the overwhelming majority of
+// notifications). When emailBodyHTML is non-empty, it is used verbatim as
+// the message body instead of the generic <h2>title</h2><p>body</p>
+// template — used by callers (e.g. a document-send customer email) that
+// need their own branding. Errors are returned for the worker to log and
+// retry on, never surfaced to the notification-create response.
 func SendNotificationEmail(cfg config.Config, to, title, body, link, emailBodyHTML string, attachment *EmailAttachment) error {
 	if to == "" {
 		return fmt.Errorf("email channel: recipient address is empty")

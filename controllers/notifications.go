@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"strconv"
+	"time"
 
 	"stonesuite-notify/audit"
 	"stonesuite-notify/config"
@@ -461,6 +462,98 @@ func (h *Handler) deliveries(w http.ResponseWriter, r *http.Request, tenantID st
 	writeJSON(w, http.StatusOK, models.APIResponse{
 		Success: true,
 		Data:    map[string]any{"deliveries": list},
+	})
+}
+
+// knownDeliveryStatuses bounds the ?status= filter on the by-status routes
+// so an arbitrary string can't be pushed into the query.
+var knownDeliveryStatuses = map[string]bool{
+	deliveries.StatusPending: true, deliveries.StatusProcessing: true,
+	deliveries.StatusSent: true, deliveries.StatusRetrying: true,
+	deliveries.StatusFailed: true, deliveries.StatusSkipped: true,
+}
+
+// defaultByStatusWindow is how far back DeliveriesByStatus looks when the
+// caller gives no ?since=.
+const defaultByStatusWindow = 7 * 24 * time.Hour
+
+// DeliveriesByStatus handles GET /api/deliveries?status=&tenantId=&since=&limit=
+// — the internal-secret-gated "which of this tenant's deliveries are in
+// state X" view (default: failed). tenantId is required and explicit, same
+// as the per-notification internal route, since there is no JWT here.
+func (h *Handler) DeliveriesByStatus(w http.ResponseWriter, r *http.Request) {
+	tenantID := r.URL.Query().Get("tenantId")
+	if tenantID == "" {
+		fail(w, http.StatusBadRequest, "tenantId is required.")
+		return
+	}
+	h.deliveriesByStatus(w, r, tenantID, audit.Entry{TenantID: tenantID, ActorType: audit.ActorService})
+}
+
+// AdminDeliveriesByStatus handles GET /api/admin/deliveries?status=&since=&limit=
+// — the same view for a signed-in tenant administrator (notification:admin).
+// The tenant comes from the caller's token, never the request.
+func (h *Handler) AdminDeliveriesByStatus(w http.ResponseWriter, r *http.Request) {
+	user, err := middleware.GetUserFromContext(r.Context())
+	if err != nil {
+		fail(w, http.StatusUnauthorized, "Authentication required.")
+		return
+	}
+	h.deliveriesByStatus(w, r, user.TenantID, audit.Entry{
+		TenantID: user.TenantID, ActorUserID: user.UserID, ActorType: audit.ActorUser,
+	})
+}
+
+// deliveriesByStatus serves both by-status routes.
+func (h *Handler) deliveriesByStatus(w http.ResponseWriter, r *http.Request, tenantID string, actor audit.Entry) {
+	q := r.URL.Query()
+
+	status := q.Get("status")
+	if status == "" {
+		status = deliveries.StatusFailed
+	}
+	if !knownDeliveryStatuses[status] {
+		fail(w, http.StatusBadRequest, "Unknown delivery status.")
+		return
+	}
+
+	since := time.Now().Add(-defaultByStatusWindow)
+	if v := q.Get("since"); v != "" {
+		parsed, err := time.Parse(time.RFC3339, v)
+		if err != nil {
+			fail(w, http.StatusBadRequest, "since must be an RFC 3339 timestamp.")
+			return
+		}
+		since = parsed
+	}
+
+	limit := 50
+	if v := q.Get("limit"); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil && parsed > 0 {
+			limit = parsed
+		}
+	}
+	if limit > deliveries.MaxListByStatusLimit {
+		limit = deliveries.MaxListByStatusLimit
+	}
+
+	list, err := h.DeliveryStore.ListByStatus(r.Context(), tenantID, status, since, limit)
+	if err != nil {
+		log.Printf("notifications: list deliveries by status %s for tenant %s: %v", status, tenantID, err)
+		fail(w, http.StatusInternalServerError, "Failed to load deliveries.")
+		return
+	}
+
+	// Same rationale as the per-notification log: this reveals who was
+	// contacted on which channel, so the read is auditable.
+	actor.Action = audit.ActionDeliveryLogViewed
+	actor.Resource = audit.ResourceDelivery
+	actor.Metadata = audit.Metadata(map[string]any{"status": status, "deliveryCount": len(list)})
+	h.Audit.Record(r.Context(), auditEntry(r, actor))
+
+	writeJSON(w, http.StatusOK, models.APIResponse{
+		Success: true,
+		Data:    map[string]any{"deliveries": list, "status": status},
 	})
 }
 

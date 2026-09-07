@@ -288,6 +288,19 @@ func (f *fakeDeliveriesStore) ListForNotification(_ context.Context, tenantID, n
 	return out, nil
 }
 
+func (f *fakeDeliveriesStore) ListByStatus(_ context.Context, tenantID, status string, _ time.Time, limit int) ([]deliveries.Delivery, error) {
+	out := []deliveries.Delivery{}
+	for _, d := range f.rows {
+		if d.TenantID == tenantID && d.Status == status {
+			out = append(out, d)
+		}
+	}
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
 func (f *fakeDeliveriesStore) find(channel string) (deliveries.Delivery, bool) {
 	for _, d := range f.rows {
 		if d.Channel == channel {
@@ -1047,6 +1060,79 @@ func TestAdminDeliveries_ScopesToCallersOwnTenant(t *testing.T) {
 	list := data["deliveries"].([]any)
 	if len(list) != 1 {
 		t.Fatalf("got %d deliveries, want 1 (only other-tenant's own row)", len(list))
+	}
+}
+
+func TestDeliveriesByStatus_Internal_DefaultsToFailedAndScopesToTenant(t *testing.T) {
+	// deliveryLogFixture has one failed row (d2, tenant t1) and one failed-
+	// looking row in another tenant is absent — d4 is 'sent'. Only t1's
+	// failed row should come back.
+	h := newTestHandler(&fakeStore{}, newFakePreferencesStore(), deliveryLogFixture(), config.Config{})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/deliveries?tenantId=t1", nil)
+	rec := httptest.NewRecorder()
+	h.DeliveriesByStatus(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", rec.Code, rec.Body.String())
+	}
+	resp := decodeResponse(t, rec)
+	data := resp.Data.(map[string]any)
+	if data["status"] != deliveries.StatusFailed {
+		t.Fatalf("status echoed = %v, want failed (the default)", data["status"])
+	}
+	list := data["deliveries"].([]any)
+	if len(list) != 1 {
+		t.Fatalf("got %d deliveries, want 1 (t1's single failed row)", len(list))
+	}
+}
+
+func TestDeliveriesByStatus_Internal_RequiresTenantID(t *testing.T) {
+	h := newTestHandler(&fakeStore{}, newFakePreferencesStore(), deliveryLogFixture(), config.Config{})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/deliveries?status=failed", nil)
+	rec := httptest.NewRecorder()
+	h.DeliveriesByStatus(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (tenantId is mandatory on the internal route)", rec.Code)
+	}
+}
+
+func TestDeliveriesByStatus_RejectsUnknownStatusAndBadSince(t *testing.T) {
+	h := newTestHandler(&fakeStore{}, newFakePreferencesStore(), deliveryLogFixture(), config.Config{})
+
+	for _, tc := range []struct{ name, query string }{
+		{"unknown status", "/api/deliveries?tenantId=t1&status=exploded"},
+		{"bad since", "/api/deliveries?tenantId=t1&since=last-tuesday"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, tc.query, nil)
+			rec := httptest.NewRecorder()
+			h.DeliveriesByStatus(rec, req)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400", rec.Code)
+			}
+		})
+	}
+}
+
+func TestAdminDeliveriesByStatus_ScopesToCallersOwnTenant(t *testing.T) {
+	// The admin route ignores any tenant in the request and uses the token's.
+	h := newTestHandler(&fakeStore{}, newFakePreferencesStore(), deliveryLogFixture(), config.Config{})
+
+	rec := authedRequest(t, http.MethodGet, "/api/admin/deliveries?status=sent&tenantId=t1",
+		"other-tenant", "admin-user", nil, h.AdminDeliveriesByStatus)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", rec.Code, rec.Body.String())
+	}
+	resp := decodeResponse(t, rec)
+	data := resp.Data.(map[string]any)
+	list := data["deliveries"].([]any)
+	// deliveryLogFixture: only d4 is (tenant other-tenant, status sent).
+	if len(list) != 1 {
+		t.Fatalf("got %d deliveries, want 1 (other-tenant's own sent row, not t1's)", len(list))
 	}
 }
 

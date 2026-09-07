@@ -1,9 +1,13 @@
 package workers
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log"
+	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -89,6 +93,9 @@ func (f *fakeDeliveries) MarkRetrying(_ context.Context, id string, attempts int
 	return nil
 }
 func (f *fakeDeliveries) ListForNotification(_ context.Context, _, _ string) ([]deliveries.Delivery, error) {
+	return nil, nil
+}
+func (f *fakeDeliveries) ListByStatus(_ context.Context, _, _ string, _ time.Time, _ int) ([]deliveries.Delivery, error) {
 	return nil, nil
 }
 
@@ -397,6 +404,39 @@ func TestAttemptDelivery_FinalFailure_AuditsFailed(t *testing.T) {
 	}
 	if entry.ActorType != audit.ActorWorker || entry.ResourceID != "d1" {
 		t.Fatalf("audit entry = %+v, want a worker-actor entry for d1", entry)
+	}
+}
+
+func TestAttemptDelivery_FinalFailure_LogsStableAlertLine(t *testing.T) {
+	// The audit row is the durable record; this greppable log line is the
+	// active signal an ops alert can match. Keep the key stable.
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	defer log.SetOutput(os.Stderr)
+
+	deps := Deps{
+		Notifications: &fakeNotifications{byID: map[string]notifications.Notification{"n1": testNotification("n1")}},
+		Deliveries:    &fakeDeliveries{},
+		PushSubs:      &fakePushSubs{},
+		Audit:         &fakeAuditRecorder{},
+		SendEmail: func(_ config.Config, _, _, _, _, _ string, _ *channels.EmailAttachment) error {
+			return errors.New("resend: unexpected status 422: the domain is not verified")
+		},
+	}
+	d := deliveries.Delivery{
+		ID: "d1", NotificationID: "n1", TenantID: "t1", RecipientUserID: "u1",
+		Channel: deliveries.ChannelEmail, Attempts: deliveries.MaxAttempts - 1,
+	}
+	attemptDelivery(context.Background(), deps, d)
+
+	got := buf.String()
+	for _, want := range []string{
+		"event=delivery_permanently_failed", "delivery_id=d1", "notification_id=n1",
+		"tenant_id=t1", "channel=email", "the domain is not verified",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("terminal-failure log missing %q\ngot: %s", want, got)
+		}
 	}
 }
 
