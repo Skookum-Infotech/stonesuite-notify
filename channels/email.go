@@ -10,7 +10,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"log"
+	"io"
 	"mime/multipart"
 	"net/http"
 	"net/smtp"
@@ -21,6 +21,10 @@ import (
 )
 
 const emailTimeout = 10 * time.Second
+
+// resendEndpoint is Resend's send-email API. A package var, not a const, so
+// tests can point it at an httptest server.
+var resendEndpoint = "https://api.resend.com/emails"
 
 // EmailAttachment is the single file this channel can attach to a
 // notification email — currently only ever the PDF from a "document sent"
@@ -35,16 +39,28 @@ type EmailAttachment struct {
 
 // SendNotificationEmail delivers a notification over email, choosing a
 // provider the same way StoneSuite-Backend's services/email.go does:
-// Resend if configured, else SMTP, else a logged no-op. attachment is
-// optional (nil for the overwhelming majority of notifications). When
-// emailBodyHTML is non-empty, it is used verbatim as the message body
-// instead of the generic <h2>title</h2><p>body</p> template — used by
-// callers (e.g. a document-send customer email) that need their own
-// branding. Errors are returned for logging by the caller but are never
-// fatal to the caller's own request.
+// Resend if configured, else SMTP. A missing provider or a missing
+// EMAIL_FROM returns an error (the delivery then retries and goes
+// terminal with a reason) rather than a silent no-op, since a delivery
+// row only reaches this function when email was actually requested.
+// attachment is optional (nil for the overwhelming majority of
+// notifications). When emailBodyHTML is non-empty, it is used verbatim as
+// the message body instead of the generic <h2>title</h2><p>body</p>
+// template — used by callers (e.g. a document-send customer email) that
+// need their own branding. Errors are returned for the worker to log and
+// retry on, never surfaced to the notification-create response.
 func SendNotificationEmail(cfg config.Config, to, title, body, link, emailBodyHTML string, attachment *EmailAttachment) error {
 	if to == "" {
 		return fmt.Errorf("email channel: recipient address is empty")
+	}
+	// A configured provider with no EMAIL_FROM cannot send: Resend rejects
+	// the request with HTTP 422 (invalid "from"), and SMTP has no envelope
+	// sender. Fail here with a message that names the missing variable
+	// instead of relaying an opaque provider error — EMAIL_FROM is a Fly
+	// secret, easy to drop in a secrets reset and (historically) documented
+	// only under SMTP.
+	if cfg.EmailConfigured() && cfg.EmailFrom == "" {
+		return fmt.Errorf("email channel: EMAIL_FROM is not set (required as the sender address for Resend and SMTP alike)")
 	}
 
 	html := emailBodyHTML
@@ -58,8 +74,11 @@ func SendNotificationEmail(cfg config.Config, to, title, body, link, emailBodyHT
 	case cfg.SMTPHost != "":
 		return sendViaSMTP(cfg, to, title, html, attachment)
 	default:
-		log.Printf("channels: email not configured, skipping send to %s (%q)", to, title)
-		return nil
+		// A delivery row only reaches this worker because Create decided
+		// email was wanted and enabled — so "no provider" here is a
+		// misconfiguration, not a no-op. Return an error so the delivery
+		// goes retrying -> failed with a clear reason, never marked sent.
+		return fmt.Errorf("email channel: no provider configured (set RESEND_API_KEY or SMTP_HOST, plus EMAIL_FROM)")
 	}
 }
 
@@ -98,7 +117,7 @@ func sendViaResend(cfg config.Config, to, subject, html string, attachment *Emai
 	}
 
 	client := &http.Client{Timeout: emailTimeout}
-	httpReq, err := http.NewRequest(http.MethodPost, "https://api.resend.com/emails", bytes.NewReader(payload))
+	httpReq, err := http.NewRequest(http.MethodPost, resendEndpoint, bytes.NewReader(payload))
 	if err != nil {
 		return fmt.Errorf("resend: build request: %w", err)
 	}
@@ -112,7 +131,12 @@ func sendViaResend(cfg config.Config, to, subject, html string, attachment *Emai
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 300 {
-		return fmt.Errorf("resend: unexpected status %d", resp.StatusCode)
+		// Include Resend's response body — it carries the actual reason
+		// (e.g. an unverified sending domain, or an invalid "from"), which a
+		// bare status code hides. This lands in notification_deliveries.last_error
+		// and the worker log, so a recurring 422 is self-diagnosing.
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
+		return fmt.Errorf("resend: unexpected status %d: %s", resp.StatusCode, bytes.TrimSpace(body))
 	}
 	return nil
 }

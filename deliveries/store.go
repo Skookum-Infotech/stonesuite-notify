@@ -38,7 +38,16 @@ type Store interface {
 	// scoped by tenant as well as notification id so holding a notification
 	// id from one tenant can never surface another tenant's delivery log.
 	ListForNotification(ctx context.Context, tenantID, notificationID string) ([]Delivery, error)
+	// ListByStatus returns a tenant's delivery rows in the given status,
+	// updated at or after `since`, newest first, capped at `limit`. Backs
+	// the "show me what failed" ops/admin view — the counterpart to
+	// ListForNotification for when the notification id isn't already known.
+	ListByStatus(ctx context.Context, tenantID, status string, since time.Time, limit int) ([]Delivery, error)
 }
+
+// MaxListByStatusLimit caps one ListByStatus page so no caller can pull an
+// unbounded delivery history in a single request.
+const MaxListByStatusLimit = 200
 
 // PGStore implements Store against Postgres.
 type PGStore struct {
@@ -186,6 +195,37 @@ func backoff(attempts int) time.Duration {
 		return 30 * time.Minute
 	}
 	return d
+}
+
+// ListByStatus returns a tenant's deliveries in `status` updated since
+// `since`, newest first, capped at min(limit, MaxListByStatusLimit).
+func (s *PGStore) ListByStatus(ctx context.Context, tenantID, status string, since time.Time, limit int) ([]Delivery, error) {
+	if limit <= 0 || limit > MaxListByStatusLimit {
+		limit = MaxListByStatusLimit
+	}
+	rows, err := s.pool.Query(ctx, `
+		SELECT `+deliveryColumns+`
+		FROM notification_deliveries
+		WHERE tenant_id = $1 AND status = $2 AND updated_at >= $3
+		ORDER BY updated_at DESC
+		LIMIT $4`, tenantID, status, since, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list deliveries by status %s: %w", status, err)
+	}
+	defer rows.Close()
+
+	out := []Delivery{}
+	for rows.Next() {
+		d, err := scanDelivery(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan delivery row: %w", err)
+		}
+		out = append(out, *d)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate deliveries: %w", err)
+	}
+	return out, nil
 }
 
 // ListForNotification returns every delivery row for one notification,
