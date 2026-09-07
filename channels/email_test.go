@@ -1,6 +1,8 @@
 package channels
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -18,6 +20,42 @@ func TestSendNotificationEmail_MissingRecipient_ReturnsError(t *testing.T) {
 	err := SendNotificationEmail(config.Config{}, "", "title", "body", "", "", nil)
 	if err == nil {
 		t.Fatal("expected an error for an empty recipient address")
+	}
+}
+
+func TestSendNotificationEmail_ConfiguredButNoEmailFrom_ReturnsNamedError(t *testing.T) {
+	// RESEND_API_KEY present, EMAIL_FROM empty — the exact production
+	// misconfiguration that made Resend 422 every send. Must fail before the
+	// provider call, with a message that names EMAIL_FROM.
+	cfg := config.Config{ResendAPIKey: "re_test_key"}
+	err := SendNotificationEmail(cfg, "customer@example.com", "Invoice INV-1 sent", "body", "", "<p>branded</p>", nil)
+	if err == nil {
+		t.Fatal("expected an error when a provider is configured but EMAIL_FROM is unset")
+	}
+	if !strings.Contains(err.Error(), "EMAIL_FROM") {
+		t.Fatalf("error must name the missing variable, got %q", err)
+	}
+}
+
+func TestSendViaResend_ErrorIncludesResponseBody(t *testing.T) {
+	const resendBody = `{"statusCode":422,"name":"validation_error","message":"The gmail.com domain is not verified."}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		_, _ = w.Write([]byte(resendBody))
+	}))
+	defer srv.Close()
+
+	orig := resendEndpoint
+	resendEndpoint = srv.URL
+	defer func() { resendEndpoint = orig }()
+
+	err := sendViaResend(config.Config{ResendAPIKey: "re_test_key", EmailFrom: "no-reply@stonesuite.app"},
+		"customer@example.com", "Invoice INV-1 sent", "<p>branded</p>", nil)
+	if err == nil {
+		t.Fatal("expected an error on a 422 response")
+	}
+	if !strings.Contains(err.Error(), "422") || !strings.Contains(err.Error(), "domain is not verified") {
+		t.Fatalf("error must carry Resend's status and response body, got %q", err)
 	}
 }
 

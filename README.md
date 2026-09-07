@@ -21,10 +21,11 @@ The service reads all configuration from environment variables (see [config/conf
 | `PORT` | no | Default `8090` |
 | `CORS_ORIGIN` | no | Comma-separated allowlist of browser origins |
 | `RESEND_API_KEY` | no | Email via Resend (tried first) |
-| `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `EMAIL_FROM` | no | Email via SMTP (fallback if no Resend key) |
+| `EMAIL_FROM` | with any email provider | Sender address for **both** Resend and SMTP — e.g. `StoneSuite <notifications@yourdomain.com>`. For Resend the domain must be verified in the Resend account, otherwise every send fails Resend validation with HTTP 422. If a provider is configured and this is unset, the email channel returns an error naming this variable rather than attempting a doomed send. |
+| `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD` | no | Email via SMTP (fallback if no Resend key) |
 | `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY`, `VAPID_SUBJECT` | no | Web Push (VAPID) |
 
-Email and push are optional channels — if unconfigured, the service still runs and simply skips that channel (logged); in-app notifications keep working.
+Email and push are optional channels — if unconfigured, the service still runs and simply skips that channel (logged); in-app notifications keep working. But a *partly* configured email provider (a `RESEND_API_KEY` or `SMTP_HOST` with no `EMAIL_FROM`) is a misconfiguration, not a skip — it fails every delivery with a clear error.
 
 ## Running
 

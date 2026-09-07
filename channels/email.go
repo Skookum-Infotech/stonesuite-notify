@@ -10,6 +10,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"mime/multipart"
 	"net/http"
@@ -21,6 +22,10 @@ import (
 )
 
 const emailTimeout = 10 * time.Second
+
+// resendEndpoint is Resend's send-email API. A package var, not a const, so
+// tests can point it at an httptest server.
+var resendEndpoint = "https://api.resend.com/emails"
 
 // EmailAttachment is the single file this channel can attach to a
 // notification email — currently only ever the PDF from a "document sent"
@@ -45,6 +50,15 @@ type EmailAttachment struct {
 func SendNotificationEmail(cfg config.Config, to, title, body, link, emailBodyHTML string, attachment *EmailAttachment) error {
 	if to == "" {
 		return fmt.Errorf("email channel: recipient address is empty")
+	}
+	// A configured provider with no EMAIL_FROM cannot send: Resend rejects
+	// the request with HTTP 422 (invalid "from"), and SMTP has no envelope
+	// sender. Fail here with a message that names the missing variable
+	// instead of relaying an opaque provider error — EMAIL_FROM is a Fly
+	// secret, easy to drop in a secrets reset and (historically) documented
+	// only under SMTP.
+	if cfg.EmailConfigured() && cfg.EmailFrom == "" {
+		return fmt.Errorf("email channel: EMAIL_FROM is not set (required as the sender address for Resend and SMTP alike)")
 	}
 
 	html := emailBodyHTML
@@ -98,7 +112,7 @@ func sendViaResend(cfg config.Config, to, subject, html string, attachment *Emai
 	}
 
 	client := &http.Client{Timeout: emailTimeout}
-	httpReq, err := http.NewRequest(http.MethodPost, "https://api.resend.com/emails", bytes.NewReader(payload))
+	httpReq, err := http.NewRequest(http.MethodPost, resendEndpoint, bytes.NewReader(payload))
 	if err != nil {
 		return fmt.Errorf("resend: build request: %w", err)
 	}
@@ -112,7 +126,12 @@ func sendViaResend(cfg config.Config, to, subject, html string, attachment *Emai
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 300 {
-		return fmt.Errorf("resend: unexpected status %d", resp.StatusCode)
+		// Include Resend's response body — it carries the actual reason
+		// (e.g. an unverified sending domain, or an invalid "from"), which a
+		// bare status code hides. This lands in notification_deliveries.last_error
+		// and the worker log, so a recurring 422 is self-diagnosing.
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
+		return fmt.Errorf("resend: unexpected status %d: %s", resp.StatusCode, bytes.TrimSpace(body))
 	}
 	return nil
 }
