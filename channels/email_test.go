@@ -9,10 +9,17 @@ import (
 	"stonesuite-notify/config"
 )
 
-func TestSendNotificationEmail_NoProviderConfigured_NoOp(t *testing.T) {
+func TestSendNotificationEmail_NoProviderConfigured_ReturnsError(t *testing.T) {
+	// A delivery row only reaches this function because Create queued an
+	// email delivery, so "no provider" is a misconfiguration: it must fail
+	// (delivery -> retrying -> failed with a reason), never return nil,
+	// which would mark the delivery sent.
 	err := SendNotificationEmail(config.Config{}, "user@example.com", "title", "body", "", "", nil)
-	if err != nil {
-		t.Fatalf("expected no-op (nil error) when no provider is configured, got %v", err)
+	if err == nil {
+		t.Fatal("expected an error when no email provider is configured, got nil")
+	}
+	if !strings.Contains(err.Error(), "no provider configured") {
+		t.Fatalf("error should explain the misconfiguration, got %q", err)
 	}
 }
 
@@ -73,10 +80,13 @@ func TestRenderEmailHTML_OmitsLinkWhenAbsent(t *testing.T) {
 	}
 }
 
-func TestSendNotificationEmail_NoAttachment_StillNoOp(t *testing.T) {
-	err := SendNotificationEmail(config.Config{}, "user@example.com", "title", "body", "", "", nil)
-	if err != nil {
-		t.Fatalf("expected no-op (nil error) when no provider is configured, got %v", err)
+func TestSendNotificationEmail_ProviderSetNoEmailFrom_FailsBeforeSend(t *testing.T) {
+	// SMTP host set, EMAIL_FROM empty: must fail without opening an SMTP
+	// connection, naming EMAIL_FROM (same guard as the Resend path).
+	err := SendNotificationEmail(config.Config{SMTPHost: "smtp.example.com"},
+		"user@example.com", "title", "body", "", "", nil)
+	if err == nil || !strings.Contains(err.Error(), "EMAIL_FROM") {
+		t.Fatalf("expected an EMAIL_FROM error, got %v", err)
 	}
 }
 

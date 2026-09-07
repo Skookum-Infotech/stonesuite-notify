@@ -11,7 +11,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"mime/multipart"
 	"net/http"
 	"net/smtp"
@@ -72,8 +71,11 @@ func SendNotificationEmail(cfg config.Config, to, title, body, link, emailBodyHT
 	case cfg.SMTPHost != "":
 		return sendViaSMTP(cfg, to, title, html, attachment)
 	default:
-		log.Printf("channels: email not configured, skipping send to %s (%q)", to, title)
-		return nil
+		// A delivery row only reaches this worker because Create decided
+		// email was wanted and enabled — so "no provider" here is a
+		// misconfiguration, not a no-op. Return an error so the delivery
+		// goes retrying -> failed with a clear reason, never marked sent.
+		return fmt.Errorf("email channel: no provider configured (set RESEND_API_KEY or SMTP_HOST, plus EMAIL_FROM)")
 	}
 }
 

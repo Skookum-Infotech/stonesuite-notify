@@ -551,7 +551,10 @@ func TestCreate_RejectsRecipientMissingBothUserIDAndEmail(t *testing.T) {
 func TestCreate_AcceptsRecipientWithEmailOnly(t *testing.T) {
 	store := &fakeStore{}
 	delivStore := &fakeDeliveriesStore{}
-	h := newTestHandler(store, newFakePreferencesStore(), delivStore, config.Config{})
+	// A sendable email config: this test exercises email-only recipient
+	// addressing, not the unsendable-channel guard.
+	h := newTestHandler(store, newFakePreferencesStore(), delivStore,
+		config.Config{ResendAPIKey: "re_x", EmailFrom: "no-reply@stonesuite.app"})
 
 	body, _ := json.Marshal(createNotificationRequest{
 		TenantID:   "t1",
@@ -641,7 +644,8 @@ func TestCreate_UserRecipient_StillResolvesPreferences(t *testing.T) {
 
 func TestCreate_EmailBodyHTML_PersistedAsAttachment(t *testing.T) {
 	store := &fakeStore{}
-	h := newTestHandler(store, newFakePreferencesStore(), &fakeDeliveriesStore{}, config.Config{})
+	h := newTestHandler(store, newFakePreferencesStore(), &fakeDeliveriesStore{},
+		config.Config{ResendAPIKey: "re_x", EmailFrom: "no-reply@stonesuite.app"})
 
 	body, _ := json.Marshal(createNotificationRequest{
 		TenantID:      "t1",
@@ -883,6 +887,86 @@ func TestHandler_Create_WithAttachment_SavesIt(t *testing.T) {
 		if string(a.Content) != "%PDF-1.4" {
 			t.Fatalf("expected decoded content %q, got %q", "%PDF-1.4", a.Content)
 		}
+	}
+}
+
+func TestHandler_Create_ExternalEmailRequest_RejectedWhenEmailNotSendable(t *testing.T) {
+	// The document-send-to-customer shape: email-only recipient, "email"
+	// channel, and a service that can't actually deliver (provider key but
+	// no EMAIL_FROM). Must fail loudly now, not queue a delivery that only
+	// ever 422s while the sender sees "sent".
+	store := &fakeStore{}
+	h := newTestHandler(store, newFakePreferencesStore(), &fakeDeliveriesStore{},
+		config.Config{ResendAPIKey: "re_x"}) // no EmailFrom => not sendable
+
+	body := `{
+		"tenantId": "t1",
+		"recipients": [{"email": "customer@example.com"}],
+		"eventType": "document.sent",
+		"resource": "invoice",
+		"resourceId": "inv-1",
+		"title": "Invoice INV-1 sent",
+		"channels": ["email"],
+		"emailBodyHtml": "<p>branded</p>"
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/api/notifications/internal", bytes.NewReader([]byte(body)))
+	rec := httptest.NewRecorder()
+	h.Create(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503; body: %s", rec.Code, rec.Body.String())
+	}
+	if len(store.rows) != 0 {
+		t.Fatalf("no notification row should be created on a hard reject, got %d", len(store.rows))
+	}
+}
+
+func TestHandler_Create_ExternalEmailRequest_AllowedWhenSendable(t *testing.T) {
+	store := &fakeStore{}
+	h := newTestHandler(store, newFakePreferencesStore(), &fakeDeliveriesStore{},
+		config.Config{ResendAPIKey: "re_x", EmailFrom: "StoneSuite <no-reply@stonesuite.app>"})
+
+	body := `{
+		"tenantId": "t1",
+		"recipients": [{"email": "customer@example.com"}],
+		"eventType": "document.sent",
+		"resource": "invoice",
+		"resourceId": "inv-1",
+		"title": "Invoice INV-1 sent",
+		"channels": ["email"]
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/api/notifications/internal", bytes.NewReader([]byte(body)))
+	rec := httptest.NewRecorder()
+	h.Create(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201; body: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandler_Create_InternalRecipient_NotBlockedByUnsendableEmail(t *testing.T) {
+	// A recipient with a userId has an in-app row as the source of truth, so
+	// an unsendable email channel must not sink the whole notification —
+	// only the external-only shape is hard-rejected.
+	store := &fakeStore{}
+	h := newTestHandler(store, newFakePreferencesStore(), &fakeDeliveriesStore{},
+		config.Config{ResendAPIKey: "re_x"}) // not sendable
+
+	body := `{
+		"tenantId": "t1",
+		"recipients": [{"userId": "u1", "email": "u1@example.com"}],
+		"eventType": "invoice.approved",
+		"resource": "invoice",
+		"resourceId": "inv-1",
+		"title": "Invoice INV-1 approved",
+		"channels": ["email"]
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/api/notifications/internal", bytes.NewReader([]byte(body)))
+	rec := httptest.NewRecorder()
+	h.Create(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201; body: %s", rec.Code, rec.Body.String())
 	}
 }
 

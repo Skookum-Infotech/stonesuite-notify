@@ -80,10 +80,19 @@ func Load() (Config, error) {
 	return cfg, nil
 }
 
-// EmailConfigured reports whether either email provider has enough
-// configuration to attempt sending.
+// EmailConfigured reports whether either email provider has a key/host set.
+// Note this is not the same as "can send" — see EmailSendable.
 func (c Config) EmailConfigured() bool {
 	return c.ResendAPIKey != "" || c.SMTPHost != ""
+}
+
+// EmailSendable reports whether the email channel can actually deliver: a
+// provider AND a sender address. A provider with no EMAIL_FROM sends
+// `{"from": ""}` to Resend, which 422s every message — so the create
+// endpoint rejects an email request in that state instead of queueing
+// deliveries that can only fail.
+func (c Config) EmailSendable() bool {
+	return c.EmailConfigured() && c.EmailFrom != ""
 }
 
 // PushConfigured reports whether VAPID keys are present for web push.

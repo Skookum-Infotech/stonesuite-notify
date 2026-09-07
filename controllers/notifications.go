@@ -328,6 +328,21 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 
 	wantsEmail := containsChannel(req.Channels, channelEmail)
 
+	// A pure external email send — every recipient is email-only, so there
+	// is no in-app row as a fallback — that this service cannot actually
+	// deliver (a provider key but no EMAIL_FROM, or no provider at all) is
+	// rejected here. The caller then fails loudly right now instead of the
+	// customer silently never receiving the message while deliveries retry
+	// and go terminal unseen. Mixed / internal requests still go through:
+	// their in-app row is the source of truth and a doomed email attempt
+	// surfaces in the delivery log.
+	if wantsEmail && allExternalRecipients(req.Recipients) && !h.Config.EmailSendable() {
+		log.Printf("notifications: rejecting external email request for tenant %s: email channel not sendable (EmailConfigured=%v EmailFrom set=%v)",
+			req.TenantID, h.Config.EmailConfigured(), h.Config.EmailFrom != "")
+		fail(w, http.StatusServiceUnavailable, "Email delivery is not configured on the notify service.")
+		return
+	}
+
 	created := make([]*notifications.Notification, 0, len(planned))
 	for _, p := range planned {
 		n, err := h.Store.Create(r.Context(), p.input)
@@ -456,6 +471,22 @@ func containsChannel(channelList []string, target string) bool {
 		}
 	}
 	return false
+}
+
+// allExternalRecipients reports whether every recipient is addressed by
+// email only (no StoneSuite user id) — i.e. the request has no in-app
+// delivery to fall back on, so a non-sendable email channel means the
+// message is undeliverable outright. False for an empty list.
+func allExternalRecipients(recipients []recipientTarget) bool {
+	if len(recipients) == 0 {
+		return false
+	}
+	for _, r := range recipients {
+		if r.UserID != "" {
+			return false
+		}
+	}
+	return true
 }
 
 // enqueueDeliveries writes the queue/log rows for one already-persisted
