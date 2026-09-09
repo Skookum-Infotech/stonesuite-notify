@@ -10,11 +10,14 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"html"
 	"io"
 	"mime/multipart"
 	"net/http"
 	"net/smtp"
 	"net/textproto"
+	"regexp"
+	"strings"
 	"time"
 
 	"stonesuite-notify/config"
@@ -63,16 +66,22 @@ func SendNotificationEmail(cfg config.Config, to, title, body, link, emailBodyHT
 		return fmt.Errorf("email channel: EMAIL_FROM is not set (required as the sender address for Resend and SMTP alike)")
 	}
 
-	html := emailBodyHTML
-	if html == "" {
-		html = renderEmailHTML(title, body, link)
+	htmlBody := emailBodyHTML
+	if htmlBody == "" {
+		htmlBody = renderEmailHTML(title, body, link)
 	}
+	// A multipart message with a text/plain alternative scores markedly
+	// better with spam filters than an HTML-only body. The templates this
+	// service receives are well-formed and inline-styled (see
+	// StoneSuite-Backend services.WrapEmailHTML), so a small derivation is
+	// enough — no need for the caller to send a second body.
+	textBody := htmlToPlainText(htmlBody)
 
 	switch {
 	case cfg.ResendAPIKey != "":
-		return sendViaResend(cfg, to, title, html, attachment)
+		return sendViaResend(cfg, to, title, htmlBody, textBody, attachment)
 	case cfg.SMTPHost != "":
-		return sendViaSMTP(cfg, to, title, html, attachment)
+		return sendViaSMTP(cfg, to, title, htmlBody, textBody, attachment)
 	default:
 		// A delivery row only reaches this worker because Create decided
 		// email was wanted and enabled — so "no provider" here is a
@@ -90,6 +99,39 @@ func renderEmailHTML(title, body, link string) string {
 	return fmt.Sprintf(`<div><h2>%s</h2><p>%s</p>%s</div>`, title, body, linkHTML)
 }
 
+var (
+	reMailHead   = regexp.MustCompile(`(?is)<head\b.*?</head>`)
+	reMailScript = regexp.MustCompile(`(?is)<(script|style)\b.*?</(script|style)>`)
+	reMailHidden = regexp.MustCompile(`(?is)<div[^>]*display:\s*none[^>]*>.*?</div>`)
+	reMailAnchor = regexp.MustCompile(`(?is)<a\b[^>]*href="([^"]*)"[^>]*>(.*?)</a>`)
+	reMailBlock  = regexp.MustCompile(`(?is)</(p|div|tr|h1|h2|h3|li)>|<br\s*/?>`)
+	reMailTag    = regexp.MustCompile(`(?s)<[^>]+>`)
+	reMailBlanks = regexp.MustCompile(`\n{3,}`)
+)
+
+// htmlToPlainText derives a text/plain alternative from a transactional
+// email's HTML body. It is deliberately minimal — it assumes the well-formed,
+// inline-styled markup this service receives (see StoneSuite-Backend
+// services.WrapEmailHTML and controllers document/welcome emails), not
+// arbitrary HTML. Anchors become "label: url" so the action link survives in
+// the text part; the hidden preheader and document head are dropped.
+func htmlToPlainText(h string) string {
+	s := reMailHead.ReplaceAllString(h, "")
+	s = reMailScript.ReplaceAllString(s, "")
+	s = reMailHidden.ReplaceAllString(s, "")
+	s = reMailAnchor.ReplaceAllString(s, "$2: $1")
+	s = reMailBlock.ReplaceAllString(s, "\n")
+	s = reMailTag.ReplaceAllString(s, "")
+	s = html.UnescapeString(s)
+
+	lines := strings.Split(s, "\n")
+	for i := range lines {
+		lines[i] = strings.TrimSpace(strings.Join(strings.Fields(lines[i]), " "))
+	}
+	s = reMailBlanks.ReplaceAllString(strings.Join(lines, "\n"), "\n\n")
+	return strings.TrimSpace(s)
+}
+
 type resendAttachment struct {
 	Filename string `json:"filename"`
 	Content  string `json:"content"`
@@ -98,13 +140,22 @@ type resendAttachment struct {
 type resendRequest struct {
 	From        string             `json:"from"`
 	To          string             `json:"to"`
+	ReplyTo     string             `json:"reply_to,omitempty"`
 	Subject     string             `json:"subject"`
 	HTML        string             `json:"html"`
+	Text        string             `json:"text,omitempty"`
 	Attachments []resendAttachment `json:"attachments,omitempty"`
 }
 
-func sendViaResend(cfg config.Config, to, subject, html string, attachment *EmailAttachment) error {
-	req := resendRequest{From: cfg.EmailFrom, To: to, Subject: subject, HTML: html}
+func sendViaResend(cfg config.Config, to, subject, htmlBody, textBody string, attachment *EmailAttachment) error {
+	req := resendRequest{
+		From:    cfg.EmailFrom,
+		To:      to,
+		ReplyTo: cfg.EmailReplyTo,
+		Subject: subject,
+		HTML:    htmlBody,
+		Text:    textBody,
+	}
 	if attachment != nil {
 		req.Attachments = []resendAttachment{{
 			Filename: attachment.FileName,
@@ -141,9 +192,9 @@ func sendViaResend(cfg config.Config, to, subject, html string, attachment *Emai
 	return nil
 }
 
-func sendViaSMTP(cfg config.Config, to, subject, html string, attachment *EmailAttachment) error {
+func sendViaSMTP(cfg config.Config, to, subject, htmlBody, textBody string, attachment *EmailAttachment) error {
 	addr := cfg.SMTPHost + ":" + cfg.SMTPPort
-	msg := buildSMTPMessage(to, cfg.EmailFrom, subject, html, attachment)
+	msg := buildSMTPMessage(to, cfg.EmailFrom, cfg.EmailReplyTo, subject, htmlBody, textBody, attachment)
 
 	var auth smtp.Auth
 	if cfg.SMTPUsername != "" {
@@ -156,32 +207,61 @@ func sendViaSMTP(cfg config.Config, to, subject, html string, attachment *EmailA
 	return nil
 }
 
-// buildSMTPMessage assembles the raw RFC 5322 message. With no attachment
-// it's the plain HTML body this function always sent before; with one, it
-// becomes a multipart/mixed message (HTML part + base64 attachment part) —
-// same approach as StoneSuite-Backend's services/email.go buildMIME, so
-// both services carry outbound attachments the same way.
-func buildSMTPMessage(to, from, subject, html string, attachment *EmailAttachment) []byte {
-	if attachment == nil {
-		return []byte("To: " + to + "\r\n" +
-			"Subject: " + subject + "\r\n" +
-			"Content-Type: text/html; charset=UTF-8\r\n" +
-			"\r\n" + html + "\r\n")
+// mimeBody returns the message's body entity and its Content-Type: a lone
+// text/html part, or a multipart/alternative pairing text/plain with
+// text/html when altText is set. buildSMTPMessage embeds this directly, or as
+// the first part of a multipart/mixed when there's an attachment.
+func mimeBody(htmlBody, altText string) (contentType string, body []byte) {
+	if altText == "" {
+		return "text/html; charset=UTF-8", []byte(htmlBody)
 	}
-
 	var buf bytes.Buffer
 	mw := multipart.NewWriter(&buf)
+	for _, part := range []struct{ ct, content string }{
+		{"text/plain; charset=UTF-8", altText},
+		{"text/html; charset=UTF-8", htmlBody},
+	} {
+		hdr := textproto.MIMEHeader{}
+		hdr.Set("Content-Type", part.ct)
+		hdr.Set("Content-Transfer-Encoding", "8bit")
+		if pw, err := mw.CreatePart(hdr); err == nil {
+			_, _ = pw.Write([]byte(part.content))
+		}
+	}
+	_ = mw.Close()
+	return "multipart/alternative; boundary=" + mw.Boundary(), buf.Bytes()
+}
 
+// buildSMTPMessage assembles the raw RFC 5322 message. The body is a
+// text/html part, or a multipart/alternative (text/plain then text/html) when
+// a plain-text alternative is supplied; an attachment wraps that body in an
+// outer multipart/mixed. Mirrors the html/text/reply_to shape Resend builds,
+// so both providers deliver the same message.
+func buildSMTPMessage(to, from, replyTo, subject, htmlBody, textBody string, attachment *EmailAttachment) []byte {
+	bodyCT, bodyBytes := mimeBody(htmlBody, textBody)
+
+	var buf bytes.Buffer
 	buf.WriteString("To: " + to + "\r\n")
+	if replyTo != "" {
+		buf.WriteString("Reply-To: " + replyTo + "\r\n")
+	}
 	buf.WriteString("Subject: " + subject + "\r\n")
 	buf.WriteString("MIME-Version: 1.0\r\n")
+
+	if attachment == nil {
+		buf.WriteString("Content-Type: " + bodyCT + "\r\n\r\n")
+		buf.Write(bodyBytes)
+		buf.WriteString("\r\n")
+		return buf.Bytes()
+	}
+
+	mw := multipart.NewWriter(&buf)
 	buf.WriteString("Content-Type: multipart/mixed; boundary=" + mw.Boundary() + "\r\n\r\n")
 
-	htmlHdr := textproto.MIMEHeader{}
-	htmlHdr.Set("Content-Type", "text/html; charset=UTF-8")
-	htmlHdr.Set("Content-Transfer-Encoding", "8bit")
-	if pw, err := mw.CreatePart(htmlHdr); err == nil {
-		_, _ = pw.Write([]byte(html))
+	bodyHdr := textproto.MIMEHeader{}
+	bodyHdr.Set("Content-Type", bodyCT)
+	if pw, err := mw.CreatePart(bodyHdr); err == nil {
+		_, _ = pw.Write(bodyBytes)
 	}
 
 	ct := attachment.ContentType

@@ -29,6 +29,10 @@ type Config struct {
 	// StoneSuite-Backend's services/email.go.
 	ResendAPIKey string
 	EmailFrom    string
+	// EmailReplyTo, when set, becomes the Reply-To header on every outbound
+	// email. Optional: transactional mail with a real reply address scores
+	// better with spam filters than a bare no-reply From. Unset ⇒ no header.
+	EmailReplyTo string
 	SMTPHost     string
 	SMTPPort     string
 	SMTPUsername string
@@ -54,6 +58,7 @@ func Load() (Config, error) {
 
 		ResendAPIKey: os.Getenv("RESEND_API_KEY"),
 		EmailFrom:    os.Getenv("EMAIL_FROM"),
+		EmailReplyTo: os.Getenv("EMAIL_REPLY_TO"),
 		SMTPHost:     os.Getenv("SMTP_HOST"),
 		SMTPPort:     getEnv("SMTP_PORT", "587"),
 		SMTPUsername: os.Getenv("SMTP_USERNAME"),

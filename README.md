@@ -22,6 +22,7 @@ The service reads all configuration from environment variables (see [config/conf
 | `CORS_ORIGIN` | no | Comma-separated allowlist of browser origins |
 | `RESEND_API_KEY` | no | Email via Resend (tried first) |
 | `EMAIL_FROM` | with any email provider | Sender address for **both** Resend and SMTP — e.g. `StoneSuite <notifications@yourdomain.com>`. For Resend the domain must be verified in the Resend account, otherwise every send fails Resend validation with HTTP 422. If a provider is configured and this is unset, the email channel returns an error naming this variable rather than attempting a doomed send. |
+| `EMAIL_REPLY_TO` | no | Sets the `Reply-To` header on every outbound email — e.g. `StoneSuite Support <support@yourdomain.com>`. Transactional mail with a real reply address is a positive signal to spam filters. Unset ⇒ no header. |
 | `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD` | no | Email via SMTP (fallback if no Resend key) |
 | `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY`, `VAPID_SUBJECT` | no | Web Push (VAPID) |
 
