@@ -1,16 +1,27 @@
 package channels
 
 import (
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"stonesuite-notify/config"
 )
 
-func TestSendNotificationEmail_NoProviderConfigured_NoOp(t *testing.T) {
+func TestSendNotificationEmail_NoProviderConfigured_ReturnsError(t *testing.T) {
+	// A delivery row only reaches this function because Create queued an
+	// email delivery, so "no provider" is a misconfiguration: it must fail
+	// (delivery -> retrying -> failed with a reason), never return nil,
+	// which would mark the delivery sent.
 	err := SendNotificationEmail(config.Config{}, "user@example.com", "title", "body", "", "", nil)
-	if err != nil {
-		t.Fatalf("expected no-op (nil error) when no provider is configured, got %v", err)
+	if err == nil {
+		t.Fatal("expected an error when no email provider is configured, got nil")
+	}
+	if !strings.Contains(err.Error(), "no provider configured") {
+		t.Fatalf("error should explain the misconfiguration, got %q", err)
 	}
 }
 
@@ -18,6 +29,42 @@ func TestSendNotificationEmail_MissingRecipient_ReturnsError(t *testing.T) {
 	err := SendNotificationEmail(config.Config{}, "", "title", "body", "", "", nil)
 	if err == nil {
 		t.Fatal("expected an error for an empty recipient address")
+	}
+}
+
+func TestSendNotificationEmail_ConfiguredButNoEmailFrom_ReturnsNamedError(t *testing.T) {
+	// RESEND_API_KEY present, EMAIL_FROM empty — the exact production
+	// misconfiguration that made Resend 422 every send. Must fail before the
+	// provider call, with a message that names EMAIL_FROM.
+	cfg := config.Config{ResendAPIKey: "re_test_key"}
+	err := SendNotificationEmail(cfg, "customer@example.com", "Invoice INV-1 sent", "body", "", "<p>branded</p>", nil)
+	if err == nil {
+		t.Fatal("expected an error when a provider is configured but EMAIL_FROM is unset")
+	}
+	if !strings.Contains(err.Error(), "EMAIL_FROM") {
+		t.Fatalf("error must name the missing variable, got %q", err)
+	}
+}
+
+func TestSendViaResend_ErrorIncludesResponseBody(t *testing.T) {
+	const resendBody = `{"statusCode":422,"name":"validation_error","message":"The gmail.com domain is not verified."}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		_, _ = w.Write([]byte(resendBody))
+	}))
+	defer srv.Close()
+
+	orig := resendEndpoint
+	resendEndpoint = srv.URL
+	defer func() { resendEndpoint = orig }()
+
+	err := sendViaResend(config.Config{ResendAPIKey: "re_test_key", EmailFrom: "no-reply@stonesuite.app"},
+		"customer@example.com", "Invoice INV-1 sent", "<p>branded</p>", "branded", nil)
+	if err == nil {
+		t.Fatal("expected an error on a 422 response")
+	}
+	if !strings.Contains(err.Error(), "422") || !strings.Contains(err.Error(), "domain is not verified") {
+		t.Fatalf("error must carry Resend's status and response body, got %q", err)
 	}
 }
 
@@ -35,15 +82,18 @@ func TestRenderEmailHTML_OmitsLinkWhenAbsent(t *testing.T) {
 	}
 }
 
-func TestSendNotificationEmail_NoAttachment_StillNoOp(t *testing.T) {
-	err := SendNotificationEmail(config.Config{}, "user@example.com", "title", "body", "", "", nil)
-	if err != nil {
-		t.Fatalf("expected no-op (nil error) when no provider is configured, got %v", err)
+func TestSendNotificationEmail_ProviderSetNoEmailFrom_FailsBeforeSend(t *testing.T) {
+	// SMTP host set, EMAIL_FROM empty: must fail without opening an SMTP
+	// connection, naming EMAIL_FROM (same guard as the Resend path).
+	err := SendNotificationEmail(config.Config{SMTPHost: "smtp.example.com"},
+		"user@example.com", "title", "body", "", "", nil)
+	if err == nil || !strings.Contains(err.Error(), "EMAIL_FROM") {
+		t.Fatalf("expected an EMAIL_FROM error, got %v", err)
 	}
 }
 
 func TestBuildSMTPMessage_IncludesAttachment(t *testing.T) {
-	msg := buildSMTPMessage("user@example.com", "from@example.com", "Invoice sent", "<p>See attached.</p>",
+	msg := buildSMTPMessage("user@example.com", "from@example.com", "", "Invoice sent", "<p>See attached.</p>", "",
 		&EmailAttachment{FileName: "INV-1.pdf", ContentType: "application/pdf", Content: []byte("%PDF-1.4")})
 	s := string(msg)
 	if !strings.Contains(s, "multipart/mixed") {
@@ -59,7 +109,7 @@ func TestBuildSMTPMessage_IncludesAttachment(t *testing.T) {
 
 func TestBuildSMTPMessage_UsesGivenHTMLVerbatim(t *testing.T) {
 	brandedHTML := `<html><body><p>Please find your invoice attached.</p><p>Regards,<br>Acme</p></body></html>`
-	msg := buildSMTPMessage("user@example.com", "from@example.com", "Invoice INV-1", brandedHTML, nil)
+	msg := buildSMTPMessage("user@example.com", "from@example.com", "", "Invoice INV-1", brandedHTML, "", nil)
 	s := string(msg)
 	if !strings.Contains(s, "Please find your invoice attached.") {
 		t.Fatalf("expected the branded HTML body verbatim, got:\n%s", s)
@@ -69,13 +119,108 @@ func TestBuildSMTPMessage_UsesGivenHTMLVerbatim(t *testing.T) {
 	}
 }
 
-func TestBuildSMTPMessage_NoAttachment_PlainHTML(t *testing.T) {
-	msg := buildSMTPMessage("user@example.com", "from@example.com", "Invoice sent", "<p>Hi.</p>", nil)
+func TestBuildSMTPMessage_NoAttachment_NoText_PlainHTML(t *testing.T) {
+	msg := buildSMTPMessage("user@example.com", "from@example.com", "", "Invoice sent", "<p>Hi.</p>", "", nil)
 	s := string(msg)
-	if strings.Contains(s, "multipart/mixed") {
-		t.Fatalf("expected a plain (non-multipart) message with no attachment, got:\n%s", s)
+	if strings.Contains(s, "multipart/") {
+		t.Fatalf("expected a plain (non-multipart) message with no attachment and no text part, got:\n%s", s)
 	}
 	if !strings.Contains(s, "<p>Hi.</p>") {
 		t.Fatalf("expected the HTML body present, got:\n%s", s)
+	}
+}
+
+func TestBuildSMTPMessage_TextAlternativeAndReplyTo(t *testing.T) {
+	msg := buildSMTPMessage("user@example.com", "from@example.com", "support@stonesuite.app",
+		"You're invited", "<p>Welcome</p>", "Welcome", nil)
+	s := string(msg)
+	if !strings.Contains(s, "multipart/alternative") {
+		t.Fatalf("expected multipart/alternative when a text part is supplied, got:\n%s", s)
+	}
+	if !strings.Contains(s, "text/plain; charset=UTF-8") || !strings.Contains(s, "text/html; charset=UTF-8") {
+		t.Fatalf("expected both a text/plain and a text/html part, got:\n%s", s)
+	}
+	if !strings.Contains(s, "Reply-To: support@stonesuite.app") {
+		t.Fatalf("expected a Reply-To header, got:\n%s", s)
+	}
+}
+
+func TestBuildSMTPMessage_TextAlternativeInsideMixedWithAttachment(t *testing.T) {
+	msg := buildSMTPMessage("user@example.com", "from@example.com", "", "Doc", "<p>See attached</p>", "See attached",
+		&EmailAttachment{FileName: "d.pdf", ContentType: "application/pdf", Content: []byte("%PDF-1.4")})
+	s := string(msg)
+	if !strings.Contains(s, "multipart/mixed") || !strings.Contains(s, "multipart/alternative") {
+		t.Fatalf("expected a multipart/alternative body nested in a multipart/mixed, got:\n%s", s)
+	}
+	if !strings.Contains(s, `filename="d.pdf"`) {
+		t.Fatalf("expected the attachment part, got:\n%s", s)
+	}
+}
+
+func TestHTMLToPlainText(t *testing.T) {
+	in := `<!DOCTYPE html><html><head><style>body{color:red}</style><title>x</title></head>` +
+		`<body><div style="display:none;">hidden preheader</div>` +
+		`<p style="x">You're invited to join <strong>Acme</strong>.</p>` +
+		`<p><a href="https://app.example/accept?token=abc" style="y">Accept invitation</a></p></body></html>`
+	out := htmlToPlainText(in)
+
+	if strings.Contains(out, "<") || strings.Contains(out, ">") {
+		t.Fatalf("expected all tags stripped, got:\n%s", out)
+	}
+	if strings.Contains(out, "hidden preheader") {
+		t.Fatalf("expected the hidden preheader dropped, got:\n%s", out)
+	}
+	if strings.Contains(out, "color:red") || strings.Contains(out, "<title>") {
+		t.Fatalf("expected <head>/<style> dropped, got:\n%s", out)
+	}
+	if !strings.Contains(out, "You're invited to join Acme.") {
+		t.Fatalf("expected the body text, got:\n%s", out)
+	}
+	if !strings.Contains(out, "Accept invitation: https://app.example/accept?token=abc") {
+		t.Fatalf("expected the anchor rendered as 'label: url', got:\n%s", out)
+	}
+}
+
+func TestSendViaResend_IncludesTextAndReplyTo(t *testing.T) {
+	var got resendRequest
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&got)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"re_1"}`))
+	}))
+	defer srv.Close()
+	orig := resendEndpoint
+	resendEndpoint = srv.URL
+	defer func() { resendEndpoint = orig }()
+
+	cfg := config.Config{ResendAPIKey: "re_test_key", EmailFrom: "no-reply@stonesuite.app", EmailReplyTo: "support@stonesuite.app"}
+	if err := sendViaResend(cfg, "customer@example.com", "You're invited", "<p>Welcome</p>", "Welcome", nil); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got.Text != "Welcome" {
+		t.Fatalf("expected the text body forwarded to Resend, got %q", got.Text)
+	}
+	if got.ReplyTo != "support@stonesuite.app" {
+		t.Fatalf("expected reply_to forwarded to Resend, got %q", got.ReplyTo)
+	}
+}
+
+func TestSendViaResend_OmitsReplyToWhenUnset(t *testing.T) {
+	var rawBody []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rawBody, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	orig := resendEndpoint
+	resendEndpoint = srv.URL
+	defer func() { resendEndpoint = orig }()
+
+	cfg := config.Config{ResendAPIKey: "re_test_key", EmailFrom: "no-reply@stonesuite.app"}
+	if err := sendViaResend(cfg, "customer@example.com", "Subject", "<p>x</p>", "x", nil); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if strings.Contains(string(rawBody), "reply_to") {
+		t.Fatalf("expected reply_to omitted when EmailReplyTo is empty, got:\n%s", rawBody)
 	}
 }

@@ -21,10 +21,12 @@ The service reads all configuration from environment variables (see [config/conf
 | `PORT` | no | Default `8090` |
 | `CORS_ORIGIN` | no | Comma-separated allowlist of browser origins |
 | `RESEND_API_KEY` | no | Email via Resend (tried first) |
-| `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `EMAIL_FROM` | no | Email via SMTP (fallback if no Resend key) |
+| `EMAIL_FROM` | with any email provider | Sender address for **both** Resend and SMTP — e.g. `StoneSuite <notifications@yourdomain.com>`. For Resend the domain must be verified in the Resend account, otherwise every send fails Resend validation with HTTP 422. If a provider is configured and this is unset, the email channel returns an error naming this variable rather than attempting a doomed send. |
+| `EMAIL_REPLY_TO` | no | Sets the `Reply-To` header on every outbound email — e.g. `StoneSuite Support <support@yourdomain.com>`. Transactional mail with a real reply address is a positive signal to spam filters. Unset ⇒ no header. |
+| `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD` | no | Email via SMTP (fallback if no Resend key) |
 | `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY`, `VAPID_SUBJECT` | no | Web Push (VAPID) |
 
-Email and push are optional channels — if unconfigured, the service still runs and simply skips that channel (logged); in-app notifications keep working.
+Email and push are optional channels — if unconfigured, the service still runs and simply skips that channel (logged); in-app notifications keep working. But a *partly* configured email provider (a `RESEND_API_KEY` or `SMTP_HOST` with no `EMAIL_FROM`) is a misconfiguration, not a skip — it fails every delivery with a clear error.
 
 ## Running
 
@@ -109,6 +111,7 @@ These act across a whole tenant and require an elevated permission that is never
 | GET | `/api/admin/tenant-defaults` | `preference:admin` | Read the tenant's org-wide default preferences |
 | PUT | `/api/admin/tenant-defaults` | `preference:admin` | Set the tenant's org-wide defaults (full replace) |
 | GET | `/api/admin/notifications/{id}/deliveries` | `notification:admin` | Delivery log for one notification in the caller's tenant |
+| GET | `/api/admin/deliveries?status=&since=&limit=` | `notification:admin` | The caller's tenant's deliveries in a given `status` (default `failed`), newest first — the "what didn't send?" view. `since` is RFC 3339 (default 7 days ago), `limit` caps at 200. |
 | GET | `/api/admin/audit-logs` | `audit:read` | Query the tenant's audit trail |
 
 ### Service-to-service (internal secret)
@@ -119,6 +122,7 @@ No end-user session exists on these calls, so each names its tenant explicitly a
 |---|---|---|
 | POST | `/api/notifications/internal` | Create notification(s) for one or more recipients (always writes the in-app row; email/push enqueued per resolved preference) |
 | GET | `/api/notifications/{id}/deliveries?tenantId=` | Delivery log for one notification — `tenantId` is **required** |
+| GET | `/api/deliveries?tenantId=&status=&since=&limit=` | A tenant's deliveries in a given `status` (default `failed`), newest first — `tenantId` **required**; `since` RFC 3339 (default 7 days ago); `limit` caps at 200. Lets an ops job pull terminal failures without already knowing the notification ids. |
 | PUT | `/api/tenant-defaults` | Set a tenant's org-wide defaults (tenant named in the body) |
 | GET | `/api/audit-logs?tenantId=` | Query a tenant's audit trail — `tenantId` is **required** |
 
@@ -150,6 +154,7 @@ Internal endpoints trust that the calling StoneSuite service already authorized 
 - **Preferences** (`preferences/`): a tenant-wide default (`tenant_notification_defaults`) plus per-user overrides (`user_notification_preferences`) resolve to an effective `{emailEnabled, inAppEnabled, pushEnabled}` per recipient. A missing row at either level means "inherit" (ultimately defaulting to all-enabled). Resolution failures fail open so an outage never blocks the in-app row.
 - **Delivery queue + log** (`deliveries/`): one `notification_deliveries` row per (notification, channel). `in_app` is written already-terminal (`sent`/`skipped`) since the notification row itself is the delivery; `email`/`push` start `pending`. No address or push endpoint is stored on this table — email comes from `notifications.recipient_email`, push subscriptions are looked up fresh at send time, so a retry never acts on stale addressing.
 - **Workers** (`workers/`): `QueueConsumer` polls every 2s for `pending` rows; `RetryWorker` polls every 15s for `retrying` rows due for another attempt (backoff: `min(30m, 1m*2^(n-1))`, 5 max attempts) and also recovers rows stuck `processing` for over 5 minutes (e.g. a crash mid-send). Both claim rows via `SELECT ... FOR UPDATE SKIP LOCKED` so multiple instances never double-send, and both call the same `attemptDelivery` to actually send.
+- **Terminal-failure signal:** when a delivery exhausts its retries the worker logs a single stable line, `event=delivery_permanently_failed …`, alongside the `delivery.failed` audit row. Point a Fly/Axiom log alert at that key — it is the only active notification that a message will never be delivered. `GET /api/deliveries?status=failed` (or `/api/admin/deliveries`) lists the rows behind it.
 - **In-app visibility vs. existence:** a notification row is always created for every recipient, regardless of their in-app preference — only `visible_in_app` (and therefore whether it shows up in `/api/notifications` or counts toward the unread badge) is gated, so email/push still have title/body/link/recipient_email to send even when in-app is off for that recipient.
 
 ## Audit trail

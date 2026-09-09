@@ -129,12 +129,14 @@ func main() {
 	mux.Handle("GET /api/admin/tenant-defaults", protected(middleware.PermPreferenceAdmin)(http.HandlerFunc(prefHandler.AdminGetTenantDefaults)))
 	mux.Handle("PUT /api/admin/tenant-defaults", protected(middleware.PermPreferenceAdmin)(http.HandlerFunc(prefHandler.AdminSetTenantDefaults)))
 	mux.Handle("GET /api/admin/notifications/{id}/deliveries", protected(middleware.PermNotificationAdmin)(http.HandlerFunc(handler.AdminDeliveries)))
+	mux.Handle("GET /api/admin/deliveries", protected(middleware.PermNotificationAdmin)(http.HandlerFunc(handler.AdminDeliveriesByStatus)))
 	mux.Handle("GET /api/admin/audit-logs", protected(middleware.PermAuditRead)(http.HandlerFunc(auditHandler.List)))
 
 	// Service-to-service routes: no end-user session, gated by the shared
 	// internal secret, and each names its tenant explicitly.
 	mux.Handle("POST /api/notifications/internal", requireInternal(http.HandlerFunc(handler.Create)))
 	mux.Handle("GET /api/notifications/{id}/deliveries", requireInternal(http.HandlerFunc(handler.Deliveries)))
+	mux.Handle("GET /api/deliveries", requireInternal(http.HandlerFunc(handler.DeliveriesByStatus)))
 	mux.Handle("PUT /api/tenant-defaults", requireInternal(http.HandlerFunc(prefHandler.SetTenantDefaults)))
 	mux.Handle("GET /api/audit-logs", requireInternal(http.HandlerFunc(auditHandler.ListInternal)))
 

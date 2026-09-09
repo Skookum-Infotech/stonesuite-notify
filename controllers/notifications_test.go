@@ -288,6 +288,19 @@ func (f *fakeDeliveriesStore) ListForNotification(_ context.Context, tenantID, n
 	return out, nil
 }
 
+func (f *fakeDeliveriesStore) ListByStatus(_ context.Context, tenantID, status string, _ time.Time, limit int) ([]deliveries.Delivery, error) {
+	out := []deliveries.Delivery{}
+	for _, d := range f.rows {
+		if d.TenantID == tenantID && d.Status == status {
+			out = append(out, d)
+		}
+	}
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
 func (f *fakeDeliveriesStore) find(channel string) (deliveries.Delivery, bool) {
 	for _, d := range f.rows {
 		if d.Channel == channel {
@@ -551,7 +564,10 @@ func TestCreate_RejectsRecipientMissingBothUserIDAndEmail(t *testing.T) {
 func TestCreate_AcceptsRecipientWithEmailOnly(t *testing.T) {
 	store := &fakeStore{}
 	delivStore := &fakeDeliveriesStore{}
-	h := newTestHandler(store, newFakePreferencesStore(), delivStore, config.Config{})
+	// A sendable email config: this test exercises email-only recipient
+	// addressing, not the unsendable-channel guard.
+	h := newTestHandler(store, newFakePreferencesStore(), delivStore,
+		config.Config{ResendAPIKey: "re_x", EmailFrom: "no-reply@stonesuite.app"})
 
 	body, _ := json.Marshal(createNotificationRequest{
 		TenantID:   "t1",
@@ -641,7 +657,8 @@ func TestCreate_UserRecipient_StillResolvesPreferences(t *testing.T) {
 
 func TestCreate_EmailBodyHTML_PersistedAsAttachment(t *testing.T) {
 	store := &fakeStore{}
-	h := newTestHandler(store, newFakePreferencesStore(), &fakeDeliveriesStore{}, config.Config{})
+	h := newTestHandler(store, newFakePreferencesStore(), &fakeDeliveriesStore{},
+		config.Config{ResendAPIKey: "re_x", EmailFrom: "no-reply@stonesuite.app"})
 
 	body, _ := json.Marshal(createNotificationRequest{
 		TenantID:      "t1",
@@ -886,6 +903,86 @@ func TestHandler_Create_WithAttachment_SavesIt(t *testing.T) {
 	}
 }
 
+func TestHandler_Create_ExternalEmailRequest_RejectedWhenEmailNotSendable(t *testing.T) {
+	// The document-send-to-customer shape: email-only recipient, "email"
+	// channel, and a service that can't actually deliver (provider key but
+	// no EMAIL_FROM). Must fail loudly now, not queue a delivery that only
+	// ever 422s while the sender sees "sent".
+	store := &fakeStore{}
+	h := newTestHandler(store, newFakePreferencesStore(), &fakeDeliveriesStore{},
+		config.Config{ResendAPIKey: "re_x"}) // no EmailFrom => not sendable
+
+	body := `{
+		"tenantId": "t1",
+		"recipients": [{"email": "customer@example.com"}],
+		"eventType": "document.sent",
+		"resource": "invoice",
+		"resourceId": "inv-1",
+		"title": "Invoice INV-1 sent",
+		"channels": ["email"],
+		"emailBodyHtml": "<p>branded</p>"
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/api/notifications/internal", bytes.NewReader([]byte(body)))
+	rec := httptest.NewRecorder()
+	h.Create(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503; body: %s", rec.Code, rec.Body.String())
+	}
+	if len(store.rows) != 0 {
+		t.Fatalf("no notification row should be created on a hard reject, got %d", len(store.rows))
+	}
+}
+
+func TestHandler_Create_ExternalEmailRequest_AllowedWhenSendable(t *testing.T) {
+	store := &fakeStore{}
+	h := newTestHandler(store, newFakePreferencesStore(), &fakeDeliveriesStore{},
+		config.Config{ResendAPIKey: "re_x", EmailFrom: "StoneSuite <no-reply@stonesuite.app>"})
+
+	body := `{
+		"tenantId": "t1",
+		"recipients": [{"email": "customer@example.com"}],
+		"eventType": "document.sent",
+		"resource": "invoice",
+		"resourceId": "inv-1",
+		"title": "Invoice INV-1 sent",
+		"channels": ["email"]
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/api/notifications/internal", bytes.NewReader([]byte(body)))
+	rec := httptest.NewRecorder()
+	h.Create(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201; body: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandler_Create_InternalRecipient_NotBlockedByUnsendableEmail(t *testing.T) {
+	// A recipient with a userId has an in-app row as the source of truth, so
+	// an unsendable email channel must not sink the whole notification —
+	// only the external-only shape is hard-rejected.
+	store := &fakeStore{}
+	h := newTestHandler(store, newFakePreferencesStore(), &fakeDeliveriesStore{},
+		config.Config{ResendAPIKey: "re_x"}) // not sendable
+
+	body := `{
+		"tenantId": "t1",
+		"recipients": [{"userId": "u1", "email": "u1@example.com"}],
+		"eventType": "invoice.approved",
+		"resource": "invoice",
+		"resourceId": "inv-1",
+		"title": "Invoice INV-1 approved",
+		"channels": ["email"]
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/api/notifications/internal", bytes.NewReader([]byte(body)))
+	rec := httptest.NewRecorder()
+	h.Create(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201; body: %s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestHandler_Create_NoAttachment_SavesNothing(t *testing.T) {
 	store := &fakeStore{}
 	h := newTestHandler(store, newFakePreferencesStore(), &fakeDeliveriesStore{}, config.Config{})
@@ -963,6 +1060,79 @@ func TestAdminDeliveries_ScopesToCallersOwnTenant(t *testing.T) {
 	list := data["deliveries"].([]any)
 	if len(list) != 1 {
 		t.Fatalf("got %d deliveries, want 1 (only other-tenant's own row)", len(list))
+	}
+}
+
+func TestDeliveriesByStatus_Internal_DefaultsToFailedAndScopesToTenant(t *testing.T) {
+	// deliveryLogFixture has one failed row (d2, tenant t1) and one failed-
+	// looking row in another tenant is absent — d4 is 'sent'. Only t1's
+	// failed row should come back.
+	h := newTestHandler(&fakeStore{}, newFakePreferencesStore(), deliveryLogFixture(), config.Config{})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/deliveries?tenantId=t1", nil)
+	rec := httptest.NewRecorder()
+	h.DeliveriesByStatus(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", rec.Code, rec.Body.String())
+	}
+	resp := decodeResponse(t, rec)
+	data := resp.Data.(map[string]any)
+	if data["status"] != deliveries.StatusFailed {
+		t.Fatalf("status echoed = %v, want failed (the default)", data["status"])
+	}
+	list := data["deliveries"].([]any)
+	if len(list) != 1 {
+		t.Fatalf("got %d deliveries, want 1 (t1's single failed row)", len(list))
+	}
+}
+
+func TestDeliveriesByStatus_Internal_RequiresTenantID(t *testing.T) {
+	h := newTestHandler(&fakeStore{}, newFakePreferencesStore(), deliveryLogFixture(), config.Config{})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/deliveries?status=failed", nil)
+	rec := httptest.NewRecorder()
+	h.DeliveriesByStatus(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (tenantId is mandatory on the internal route)", rec.Code)
+	}
+}
+
+func TestDeliveriesByStatus_RejectsUnknownStatusAndBadSince(t *testing.T) {
+	h := newTestHandler(&fakeStore{}, newFakePreferencesStore(), deliveryLogFixture(), config.Config{})
+
+	for _, tc := range []struct{ name, query string }{
+		{"unknown status", "/api/deliveries?tenantId=t1&status=exploded"},
+		{"bad since", "/api/deliveries?tenantId=t1&since=last-tuesday"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, tc.query, nil)
+			rec := httptest.NewRecorder()
+			h.DeliveriesByStatus(rec, req)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400", rec.Code)
+			}
+		})
+	}
+}
+
+func TestAdminDeliveriesByStatus_ScopesToCallersOwnTenant(t *testing.T) {
+	// The admin route ignores any tenant in the request and uses the token's.
+	h := newTestHandler(&fakeStore{}, newFakePreferencesStore(), deliveryLogFixture(), config.Config{})
+
+	rec := authedRequest(t, http.MethodGet, "/api/admin/deliveries?status=sent&tenantId=t1",
+		"other-tenant", "admin-user", nil, h.AdminDeliveriesByStatus)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", rec.Code, rec.Body.String())
+	}
+	resp := decodeResponse(t, rec)
+	data := resp.Data.(map[string]any)
+	list := data["deliveries"].([]any)
+	// deliveryLogFixture: only d4 is (tenant other-tenant, status sent).
+	if len(list) != 1 {
+		t.Fatalf("got %d deliveries, want 1 (other-tenant's own sent row, not t1's)", len(list))
 	}
 }
 

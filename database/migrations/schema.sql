@@ -218,3 +218,10 @@ ALTER TABLE notification_deliveries ALTER COLUMN recipient_user_id DROP NOT NULL
 -- HTML — e.g. the document-send customer email. Empty string means "use
 -- the generic template"; see channels.SendNotificationEmail.
 ALTER TABLE notification_attachments ADD COLUMN IF NOT EXISTS email_body_html TEXT NOT NULL DEFAULT '';
+
+-- Serves the "list a tenant's deliveries by status since T" query
+-- (deliveries.Store.ListByStatus) behind the admin/ops "what failed?"
+-- view. Distinct from idx_deliveries_claim (status, next_attempt_at),
+-- which is workers-only and not tenant-scoped.
+CREATE INDEX IF NOT EXISTS idx_deliveries_tenant_status
+    ON notification_deliveries (tenant_id, status, updated_at DESC);

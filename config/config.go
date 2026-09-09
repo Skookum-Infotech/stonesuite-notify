@@ -29,6 +29,10 @@ type Config struct {
 	// StoneSuite-Backend's services/email.go.
 	ResendAPIKey string
 	EmailFrom    string
+	// EmailReplyTo, when set, becomes the Reply-To header on every outbound
+	// email. Optional: transactional mail with a real reply address scores
+	// better with spam filters than a bare no-reply From. Unset ⇒ no header.
+	EmailReplyTo string
 	SMTPHost     string
 	SMTPPort     string
 	SMTPUsername string
@@ -54,6 +58,7 @@ func Load() (Config, error) {
 
 		ResendAPIKey: os.Getenv("RESEND_API_KEY"),
 		EmailFrom:    os.Getenv("EMAIL_FROM"),
+		EmailReplyTo: os.Getenv("EMAIL_REPLY_TO"),
 		SMTPHost:     os.Getenv("SMTP_HOST"),
 		SMTPPort:     getEnv("SMTP_PORT", "587"),
 		SMTPUsername: os.Getenv("SMTP_USERNAME"),
@@ -80,10 +85,19 @@ func Load() (Config, error) {
 	return cfg, nil
 }
 
-// EmailConfigured reports whether either email provider has enough
-// configuration to attempt sending.
+// EmailConfigured reports whether either email provider has a key/host set.
+// Note this is not the same as "can send" — see EmailSendable.
 func (c Config) EmailConfigured() bool {
 	return c.ResendAPIKey != "" || c.SMTPHost != ""
+}
+
+// EmailSendable reports whether the email channel can actually deliver: a
+// provider AND a sender address. A provider with no EMAIL_FROM sends
+// `{"from": ""}` to Resend, which 422s every message — so the create
+// endpoint rejects an email request in that state instead of queueing
+// deliveries that can only fail.
+func (c Config) EmailSendable() bool {
+	return c.EmailConfigured() && c.EmailFrom != ""
 }
 
 // PushConfigured reports whether VAPID keys are present for web push.
