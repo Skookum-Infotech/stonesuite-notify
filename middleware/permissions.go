@@ -98,11 +98,12 @@ func Protected(jwtSecret, permission string) func(http.Handler) http.Handler {
 	}
 }
 
-// parsePermissionsClaim normalises the shapes a "permissions" JWT claim can
-// arrive in. JSON decoding yields []any for arrays; a claim minted as a
-// single space- or comma-delimited string (the OAuth "scope" convention) is
-// accepted too so this service does not constrain how the backend mints it.
-func parsePermissionsClaim(raw any) []string {
+// parseStringListClaim normalises the shapes a string-list JWT claim (e.g.
+// "permissions", "accessible_resources") can arrive in. JSON decoding yields
+// []any for arrays; a claim minted as a single space- or comma-delimited
+// string (the OAuth "scope" convention) is accepted too so this service does
+// not constrain how the backend mints it.
+func parseStringListClaim(raw any) []string {
 	switch v := raw.(type) {
 	case []any:
 		out := make([]string, 0, len(v))
