@@ -27,13 +27,20 @@ const userContextKey contextKey = "userContext"
 // Backend does not mint it today, so it is usually empty — see Can in
 // permissions.go for how authorization degrades to the self-service set in
 // that case.
+//
+// AccessibleResources is read from an optional "accessible_resources" claim
+// and names the notification `resource` values (e.g. "estimate",
+// "salesorder") the caller may see. An empty list means unrestricted — it is
+// not yet minted by StoneSuite-Backend for every role, so absence must not
+// hide notifications from callers who predate the claim.
 type UserContext struct {
-	ID           string
-	Email        string
-	TenantID     string
-	UserID       string
-	ActiveRoleID string
-	Permissions  []string
+	ID                  string
+	Email               string
+	TenantID            string
+	UserID              string
+	ActiveRoleID        string
+	Permissions         []string
+	AccessibleResources []string
 }
 
 // RequireAuth verifies the incoming JWT (Bearer header or the httpOnly
@@ -86,12 +93,13 @@ func RequireAuth(jwtSecret string) func(http.Handler) http.Handler {
 			// "id" — there is no separate "user_id" claim (generateTenantJWT
 			// never sets one), so "id" doubles as the per-user scoping key.
 			ctx := contextWithUser(r.Context(), UserContext{
-				ID:           identityID,
-				Email:        email,
-				TenantID:     tenantID,
-				UserID:       identityID,
-				ActiveRoleID: activeRoleID,
-				Permissions:  parsePermissionsClaim(claims["permissions"]),
+				ID:                  identityID,
+				Email:               email,
+				TenantID:            tenantID,
+				UserID:              identityID,
+				ActiveRoleID:        activeRoleID,
+				Permissions:         parseStringListClaim(claims["permissions"]),
+				AccessibleResources: parseStringListClaim(claims["accessible_resources"]),
 			})
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})

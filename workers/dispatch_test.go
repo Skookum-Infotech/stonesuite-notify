@@ -37,16 +37,20 @@ func (f *fakeNotifications) Get(_ context.Context, _, id string) (*notifications
 	}
 	return &n, nil
 }
-func (f *fakeNotifications) CountForUser(_ context.Context, _, _ string, _ bool) (int, error) {
+func (f *fakeNotifications) CountForUser(_ context.Context, _, _ string, _ []string, _ bool) (int, error) {
 	return 0, nil
 }
 
-func (f *fakeNotifications) ListForUser(_ context.Context, _, _ string, _ bool, _, _ int) ([]notifications.Notification, error) {
+func (f *fakeNotifications) ListForUser(_ context.Context, _, _ string, _ []string, _ bool, _, _ int) ([]notifications.Notification, error) {
 	return nil, nil
 }
-func (f *fakeNotifications) UnreadCount(_ context.Context, _, _ string) (int, error) { return 0, nil }
-func (f *fakeNotifications) MarkRead(_ context.Context, _, _, _ string) error        { return nil }
-func (f *fakeNotifications) MarkAllRead(_ context.Context, _, _ string) error        { return nil }
+func (f *fakeNotifications) UnreadCount(_ context.Context, _, _ string, _ []string) (int, error) {
+	return 0, nil
+}
+func (f *fakeNotifications) MarkRead(_ context.Context, _, _, _ string) error { return nil }
+func (f *fakeNotifications) MarkAllRead(_ context.Context, _, _ string, _ []string) error {
+	return nil
+}
 func (f *fakeNotifications) SaveAttachment(_ context.Context, _ string, _ notifications.AttachmentInput) error {
 	return nil
 }

@@ -24,15 +24,20 @@ type Store interface {
 	Get(ctx context.Context, tenantID, id string) (*Notification, error)
 	// ListForUser returns one page of the recipient's feed, newest first.
 	// The bell dropdown passes offset 0; the "view all" screen pages
-	// through with a non-zero offset.
-	ListForUser(ctx context.Context, tenantID, recipientUserID string, unreadOnly bool, limit, offset int) ([]Notification, error)
+	// through with a non-zero offset. allowedResources restricts rows to
+	// those whose `resource` is in the list; an empty list means
+	// unrestricted (see UserContext.AccessibleResources).
+	ListForUser(ctx context.Context, tenantID, recipientUserID string, allowedResources []string, unreadOnly bool, limit, offset int) ([]Notification, error)
 	// CountForUser returns how many rows ListForUser would return in total
 	// under the same filter, ignoring paging — the denominator the "view
 	// all" screen needs to render page controls.
-	CountForUser(ctx context.Context, tenantID, recipientUserID string, unreadOnly bool) (int, error)
-	UnreadCount(ctx context.Context, tenantID, recipientUserID string) (int, error)
+	CountForUser(ctx context.Context, tenantID, recipientUserID string, allowedResources []string, unreadOnly bool) (int, error)
+	UnreadCount(ctx context.Context, tenantID, recipientUserID string, allowedResources []string) (int, error)
 	MarkRead(ctx context.Context, tenantID, recipientUserID, id string) error
-	MarkAllRead(ctx context.Context, tenantID, recipientUserID string) error
+	// MarkAllRead marks every unread row within allowedResources as read,
+	// so resource-restricted rows are never marked read without the
+	// recipient having actually been able to see them.
+	MarkAllRead(ctx context.Context, tenantID, recipientUserID string, allowedResources []string) error
 	// SaveAttachment persists the single attachment for a notification's
 	// email delivery. Called at most once per notification, from
 	// controllers.Handler.Create, only when email delivery was actually
@@ -124,21 +129,22 @@ func (s *PGStore) Get(ctx context.Context, tenantID, id string) (*Notification, 
 
 // ListForUser returns one page of the recipient's notifications, newest
 // first.
-func (s *PGStore) ListForUser(ctx context.Context, tenantID, recipientUserID string, unreadOnly bool, limit, offset int) ([]Notification, error) {
+func (s *PGStore) ListForUser(ctx context.Context, tenantID, recipientUserID string, allowedResources []string, unreadOnly bool, limit, offset int) ([]Notification, error) {
 	limit, offset = NormalizePaging(limit, offset)
 
 	query := `SELECT ` + notificationColumns + `
 		FROM notifications
-		WHERE tenant_id = $1 AND recipient_user_id = $2 AND visible_in_app = true`
+		WHERE tenant_id = $1 AND recipient_user_id = $2 AND visible_in_app = true
+		AND (cardinality($3::text[]) = 0 OR resource = ANY($3::text[]))`
 	if unreadOnly {
 		query += ` AND read_at IS NULL`
 	}
 	// id breaks ties so paging is stable when several rows share a
 	// created_at — without it a row can repeat on one page and be skipped
 	// on the next.
-	query += ` ORDER BY created_at DESC, id DESC LIMIT $3 OFFSET $4`
+	query += ` ORDER BY created_at DESC, id DESC LIMIT $4 OFFSET $5`
 
-	rows, err := s.pool.Query(ctx, query, tenantID, recipientUserID, limit, offset)
+	rows, err := s.pool.Query(ctx, query, tenantID, recipientUserID, allowedResources, limit, offset)
 	if err != nil {
 		return nil, fmt.Errorf("list notifications: %w", err)
 	}
@@ -160,15 +166,16 @@ func (s *PGStore) ListForUser(ctx context.Context, tenantID, recipientUserID str
 
 // CountForUser returns the total number of feed rows matching the same
 // filter ListForUser applies, ignoring paging.
-func (s *PGStore) CountForUser(ctx context.Context, tenantID, recipientUserID string, unreadOnly bool) (int, error) {
+func (s *PGStore) CountForUser(ctx context.Context, tenantID, recipientUserID string, allowedResources []string, unreadOnly bool) (int, error) {
 	query := `SELECT COUNT(*) FROM notifications
-		WHERE tenant_id = $1 AND recipient_user_id = $2 AND visible_in_app = true`
+		WHERE tenant_id = $1 AND recipient_user_id = $2 AND visible_in_app = true
+		AND (cardinality($3::text[]) = 0 OR resource = ANY($3::text[]))`
 	if unreadOnly {
 		query += ` AND read_at IS NULL`
 	}
 
 	var count int
-	if err := s.pool.QueryRow(ctx, query, tenantID, recipientUserID).Scan(&count); err != nil {
+	if err := s.pool.QueryRow(ctx, query, tenantID, recipientUserID, allowedResources).Scan(&count); err != nil {
 		return 0, fmt.Errorf("count notifications: %w", err)
 	}
 	return count, nil
@@ -176,12 +183,13 @@ func (s *PGStore) CountForUser(ctx context.Context, tenantID, recipientUserID st
 
 // UnreadCount returns the number of unread notifications for the recipient —
 // the value the frontend bell polls.
-func (s *PGStore) UnreadCount(ctx context.Context, tenantID, recipientUserID string) (int, error) {
+func (s *PGStore) UnreadCount(ctx context.Context, tenantID, recipientUserID string, allowedResources []string) (int, error) {
 	var count int
 	err := s.pool.QueryRow(ctx, `
 		SELECT COUNT(*) FROM notifications
-		WHERE tenant_id = $1 AND recipient_user_id = $2 AND visible_in_app = true AND read_at IS NULL`,
-		tenantID, recipientUserID).Scan(&count)
+		WHERE tenant_id = $1 AND recipient_user_id = $2 AND visible_in_app = true AND read_at IS NULL
+		AND (cardinality($3::text[]) = 0 OR resource = ANY($3::text[]))`,
+		tenantID, recipientUserID, allowedResources).Scan(&count)
 	if err != nil {
 		return 0, fmt.Errorf("count unread notifications: %w", err)
 	}
@@ -204,12 +212,14 @@ func (s *PGStore) MarkRead(ctx context.Context, tenantID, recipientUserID, id st
 	return nil
 }
 
-// MarkAllRead marks every unread notification for the recipient as read.
-func (s *PGStore) MarkAllRead(ctx context.Context, tenantID, recipientUserID string) error {
+// MarkAllRead marks every unread notification within allowedResources for
+// the recipient as read (empty allowedResources means unrestricted).
+func (s *PGStore) MarkAllRead(ctx context.Context, tenantID, recipientUserID string, allowedResources []string) error {
 	if _, err := s.pool.Exec(ctx, `
 		UPDATE notifications SET read_at = NOW()
-		WHERE tenant_id = $1 AND recipient_user_id = $2 AND read_at IS NULL`,
-		tenantID, recipientUserID); err != nil {
+		WHERE tenant_id = $1 AND recipient_user_id = $2 AND read_at IS NULL
+		AND (cardinality($3::text[]) = 0 OR resource = ANY($3::text[]))`,
+		tenantID, recipientUserID, allowedResources); err != nil {
 		return fmt.Errorf("mark all notifications read: %w", err)
 	}
 	return nil
