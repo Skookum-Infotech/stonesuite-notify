@@ -51,7 +51,7 @@ func (h *Handler) Summary(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	count, err := h.Store.UnreadCount(r.Context(), user.TenantID, user.UserID)
+	count, err := h.Store.UnreadCount(r.Context(), user.TenantID, user.UserID, user.AccessibleResources)
 	if err != nil {
 		log.Printf("notifications: summary for user %s: %v", user.UserID, err)
 		fail(w, http.StatusInternalServerError, "Failed to load notification summary.")
@@ -83,7 +83,7 @@ func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	list, err := h.Store.ListForUser(r.Context(), user.TenantID, user.UserID, unreadOnly, limit, 0)
+	list, err := h.Store.ListForUser(r.Context(), user.TenantID, user.UserID, user.AccessibleResources, unreadOnly, limit, 0)
 	if err != nil {
 		log.Printf("notifications: list for user %s: %v", user.UserID, err)
 		fail(w, http.StatusInternalServerError, "Failed to load notifications.")
@@ -109,14 +109,14 @@ func (h *Handler) History(w http.ResponseWriter, r *http.Request) {
 	unreadOnly := r.URL.Query().Get("unreadOnly") == "true"
 	page, pageSize := parsePageParams(r.URL.Query(), notifications.DefaultPageSize, notifications.MaxPageSize)
 
-	total, err := h.Store.CountForUser(r.Context(), user.TenantID, user.UserID, unreadOnly)
+	total, err := h.Store.CountForUser(r.Context(), user.TenantID, user.UserID, user.AccessibleResources, unreadOnly)
 	if err != nil {
 		log.Printf("notifications: count history for user %s: %v", user.UserID, err)
 		fail(w, http.StatusInternalServerError, "Failed to load notifications.")
 		return
 	}
 
-	list, err := h.Store.ListForUser(r.Context(), user.TenantID, user.UserID, unreadOnly, pageSize, (page-1)*pageSize)
+	list, err := h.Store.ListForUser(r.Context(), user.TenantID, user.UserID, user.AccessibleResources, unreadOnly, pageSize, (page-1)*pageSize)
 	if err != nil {
 		log.Printf("notifications: list history for user %s: %v", user.UserID, err)
 		fail(w, http.StatusInternalServerError, "Failed to load notifications.")
@@ -176,7 +176,7 @@ func (h *Handler) MarkAllRead(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.Store.MarkAllRead(r.Context(), user.TenantID, user.UserID); err != nil {
+	if err := h.Store.MarkAllRead(r.Context(), user.TenantID, user.UserID, user.AccessibleResources); err != nil {
 		log.Printf("notifications: mark all read for user %s: %v", user.UserID, err)
 		fail(w, http.StatusInternalServerError, "Failed to mark notifications read.")
 		return

@@ -72,11 +72,11 @@ func (f *fakeStore) Get(_ context.Context, tenantID, id string) (*notifications.
 	return nil, notifications.ErrNotFound
 }
 
-func (f *fakeStore) ListForUser(_ context.Context, tenantID, recipientUserID string, unreadOnly bool, limit, offset int) ([]notifications.Notification, error) {
+func (f *fakeStore) ListForUser(_ context.Context, tenantID, recipientUserID string, allowedResources []string, unreadOnly bool, limit, offset int) ([]notifications.Notification, error) {
 	if f.forceErr != nil {
 		return nil, f.forceErr
 	}
-	matching := f.matching(tenantID, recipientUserID, unreadOnly)
+	matching := f.matching(tenantID, recipientUserID, allowedResources, unreadOnly)
 
 	if offset >= len(matching) {
 		return nil, nil
@@ -88,16 +88,17 @@ func (f *fakeStore) ListForUser(_ context.Context, tenantID, recipientUserID str
 	return matching[offset:end], nil
 }
 
-func (f *fakeStore) CountForUser(_ context.Context, tenantID, recipientUserID string, unreadOnly bool) (int, error) {
+func (f *fakeStore) CountForUser(_ context.Context, tenantID, recipientUserID string, allowedResources []string, unreadOnly bool) (int, error) {
 	if f.forceErr != nil {
 		return 0, f.forceErr
 	}
-	return len(f.matching(tenantID, recipientUserID, unreadOnly)), nil
+	return len(f.matching(tenantID, recipientUserID, allowedResources, unreadOnly)), nil
 }
 
 // matching applies the same filter ListForUser and CountForUser share, so a
-// paged read and its total can never disagree.
-func (f *fakeStore) matching(tenantID, recipientUserID string, unreadOnly bool) []notifications.Notification {
+// paged read and its total can never disagree. An empty allowedResources
+// means unrestricted, mirroring the real store's SQL.
+func (f *fakeStore) matching(tenantID, recipientUserID string, allowedResources []string, unreadOnly bool) []notifications.Notification {
 	var out []notifications.Notification
 	for _, n := range f.rows {
 		if n.TenantID != tenantID || n.RecipientUserID != recipientUserID {
@@ -106,18 +107,33 @@ func (f *fakeStore) matching(tenantID, recipientUserID string, unreadOnly bool) 
 		if unreadOnly && n.ReadAt != nil {
 			continue
 		}
+		if len(allowedResources) > 0 && !contains(allowedResources, n.Resource) {
+			continue
+		}
 		out = append(out, n)
 	}
 	return out
 }
 
-func (f *fakeStore) UnreadCount(_ context.Context, tenantID, recipientUserID string) (int, error) {
+func contains(list []string, target string) bool {
+	for _, v := range list {
+		if v == target {
+			return true
+		}
+	}
+	return false
+}
+
+func (f *fakeStore) UnreadCount(_ context.Context, tenantID, recipientUserID string, allowedResources []string) (int, error) {
 	if f.forceErr != nil {
 		return 0, f.forceErr
 	}
 	count := 0
 	for _, n := range f.rows {
 		if n.TenantID == tenantID && n.RecipientUserID == recipientUserID && n.ReadAt == nil {
+			if len(allowedResources) > 0 && !contains(allowedResources, n.Resource) {
+				continue
+			}
 			count++
 		}
 	}
@@ -139,7 +155,7 @@ func (f *fakeStore) MarkRead(_ context.Context, tenantID, recipientUserID, id st
 	return notifications.ErrNotFound
 }
 
-func (f *fakeStore) MarkAllRead(_ context.Context, tenantID, recipientUserID string) error {
+func (f *fakeStore) MarkAllRead(_ context.Context, tenantID, recipientUserID string, allowedResources []string) error {
 	if f.forceErr != nil {
 		return f.forceErr
 	}
@@ -147,6 +163,9 @@ func (f *fakeStore) MarkAllRead(_ context.Context, tenantID, recipientUserID str
 	for i := range f.rows {
 		n := &f.rows[i]
 		if n.TenantID == tenantID && n.RecipientUserID == recipientUserID && n.ReadAt == nil {
+			if len(allowedResources) > 0 && !contains(allowedResources, n.Resource) {
+				continue
+			}
 			n.ReadAt = &now
 		}
 	}
@@ -390,6 +409,36 @@ func authedRequestWithPath(t *testing.T, method, target, tenantID, userID string
 	return rec
 }
 
+// authedRequestWithResources is authedRequest for tests exercising the
+// "accessible_resources" claim (resource-scoped notification visibility). A
+// nil/empty accessibleResources omits the claim entirely, matching a token
+// minted before StoneSuite-Backend supports it.
+func authedRequestWithResources(t *testing.T, method, target, tenantID, userID string, accessibleResources []string, next http.HandlerFunc) *httptest.ResponseRecorder {
+	t.Helper()
+
+	claims := jwt.MapClaims{
+		"id":        userID,
+		"email":     "user@example.com",
+		"tenant_id": tenantID,
+		"exp":       time.Now().Add(time.Hour).Unix(),
+	}
+	if len(accessibleResources) > 0 {
+		claims["accessible_resources"] = accessibleResources
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	signed, err := token.SignedString([]byte(testJWTSecret))
+	if err != nil {
+		t.Fatalf("sign token: %v", err)
+	}
+
+	req := httptest.NewRequest(method, target, bytes.NewReader(nil))
+	req.Header.Set("Authorization", "Bearer "+signed)
+
+	rec := httptest.NewRecorder()
+	middleware.RequireAuth(testJWTSecret)(next).ServeHTTP(rec, req)
+	return rec
+}
+
 func decodeResponse(t *testing.T, rec *httptest.ResponseRecorder) models.APIResponse {
 	t.Helper()
 	var resp models.APIResponse
@@ -439,6 +488,97 @@ func TestList_ScopesToCallerOnly(t *testing.T) {
 	list := data["notifications"].([]any)
 	if len(list) != 1 {
 		t.Fatalf("got %d notifications, want 1 (must not leak other users' rows)", len(list))
+	}
+}
+
+func TestList_UnrestrictedTokenSeesAllResources(t *testing.T) {
+	// A token with no accessible_resources claim (StoneSuite-Backend not
+	// yet minting it for this user/role) must keep seeing everything.
+	store := &fakeStore{rows: []notifications.Notification{
+		{ID: "1", TenantID: "t1", RecipientUserID: "u1", Resource: "estimate"},
+		{ID: "2", TenantID: "t1", RecipientUserID: "u1", Resource: "salesorder"},
+	}}
+	h := newTestHandler(store, newFakePreferencesStore(), &fakeDeliveriesStore{}, config.Config{})
+
+	rec := authedRequestWithResources(t, http.MethodGet, "/api/notifications", "t1", "u1", nil, h.List)
+
+	resp := decodeResponse(t, rec)
+	list := resp.Data.(map[string]any)["notifications"].([]any)
+	if len(list) != 2 {
+		t.Fatalf("got %d notifications, want 2 (unrestricted token must see every resource)", len(list))
+	}
+}
+
+func TestList_RestrictedTokenOnlySeesAllowedResource(t *testing.T) {
+	store := &fakeStore{rows: []notifications.Notification{
+		{ID: "1", TenantID: "t1", RecipientUserID: "u1", Resource: "estimate"},
+		{ID: "2", TenantID: "t1", RecipientUserID: "u1", Resource: "salesorder"},
+	}}
+	h := newTestHandler(store, newFakePreferencesStore(), &fakeDeliveriesStore{}, config.Config{})
+
+	rec := authedRequestWithResources(t, http.MethodGet, "/api/notifications", "t1", "u1", []string{"estimate"}, h.List)
+
+	resp := decodeResponse(t, rec)
+	list := resp.Data.(map[string]any)["notifications"].([]any)
+	if len(list) != 1 {
+		t.Fatalf("got %d notifications, want 1 (must not leak salesorder rows to an estimate-only caller)", len(list))
+	}
+	if got := list[0].(map[string]any)["resource"]; got != "estimate" {
+		t.Fatalf("resource = %v, want estimate", got)
+	}
+}
+
+func TestHistory_TotalMatchesRestrictedResource(t *testing.T) {
+	store := &fakeStore{rows: []notifications.Notification{
+		{ID: "1", TenantID: "t1", RecipientUserID: "u1", Resource: "estimate"},
+		{ID: "2", TenantID: "t1", RecipientUserID: "u1", Resource: "salesorder"},
+		{ID: "3", TenantID: "t1", RecipientUserID: "u1", Resource: "salesorder"},
+	}}
+	h := newTestHandler(store, newFakePreferencesStore(), &fakeDeliveriesStore{}, config.Config{})
+
+	rec := authedRequestWithResources(t, http.MethodGet, "/api/notifications/history", "t1", "u1", []string{"salesorder"}, h.History)
+
+	resp := decodeResponse(t, rec)
+	data := resp.Data.(map[string]any)
+	list := data["notifications"].([]any)
+	pagination := data["pagination"].(map[string]any)
+	if len(list) != 2 {
+		t.Fatalf("got %d notifications, want 2", len(list))
+	}
+	if pagination["total"] != float64(2) {
+		t.Fatalf("pagination total = %v, want 2 (must match the restricted row count, not all rows)", pagination["total"])
+	}
+}
+
+func TestSummary_UnreadCountRespectsAccessibleResources(t *testing.T) {
+	store := &fakeStore{rows: []notifications.Notification{
+		{ID: "1", TenantID: "t1", RecipientUserID: "u1", Resource: "estimate"},
+		{ID: "2", TenantID: "t1", RecipientUserID: "u1", Resource: "salesorder"},
+	}}
+	h := newTestHandler(store, newFakePreferencesStore(), &fakeDeliveriesStore{}, config.Config{})
+
+	rec := authedRequestWithResources(t, http.MethodGet, "/api/notifications/summary", "t1", "u1", []string{"estimate"}, h.Summary)
+
+	resp := decodeResponse(t, rec)
+	if got := resp.Data.(map[string]any)["unreadCount"]; got != float64(1) {
+		t.Fatalf("unreadCount = %v, want 1 (salesorder row must not count for an estimate-only caller)", got)
+	}
+}
+
+func TestMarkAllRead_DoesNotMarkRestrictedResourceRead(t *testing.T) {
+	store := &fakeStore{rows: []notifications.Notification{
+		{ID: "1", TenantID: "t1", RecipientUserID: "u1", Resource: "estimate"},
+		{ID: "2", TenantID: "t1", RecipientUserID: "u1", Resource: "salesorder"},
+	}}
+	h := newTestHandler(store, newFakePreferencesStore(), &fakeDeliveriesStore{}, config.Config{})
+
+	authedRequestWithResources(t, http.MethodPost, "/api/notifications/read-all", "t1", "u1", []string{"estimate"}, h.MarkAllRead)
+
+	for _, n := range store.rows {
+		wantRead := n.Resource == "estimate"
+		if isRead := n.ReadAt != nil; isRead != wantRead {
+			t.Fatalf("row %s (%s): read = %v, want %v", n.ID, n.Resource, isRead, wantRead)
+		}
 	}
 }
 
