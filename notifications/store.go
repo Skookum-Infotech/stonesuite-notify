@@ -127,9 +127,26 @@ func (s *PGStore) Get(ctx context.Context, tenantID, id string) (*Notification, 
 	return n, nil
 }
 
+// nonNilResources returns allowedResources unchanged, except a nil slice
+// becomes a non-nil empty one. pgx binds a nil Go slice as SQL NULL for a
+// text[] parameter, and cardinality(NULL::text[]) is NULL, not 0 — so the
+// query's "cardinality($n::text[]) = 0" unrestricted-fallback silently
+// evaluates to NULL (falsy in a WHERE clause) instead of true, turning
+// "no restriction" into "match nothing". A real empty array avoids that:
+// cardinality('{}'::text[]) = 0. allowedResources is nil for every caller
+// until StoneSuite-Backend mints a non-empty accessible_resources claim, so
+// this affected every account, not just resource-restricted ones.
+func nonNilResources(allowedResources []string) []string {
+	if allowedResources == nil {
+		return []string{}
+	}
+	return allowedResources
+}
+
 // ListForUser returns one page of the recipient's notifications, newest
 // first.
 func (s *PGStore) ListForUser(ctx context.Context, tenantID, recipientUserID string, allowedResources []string, unreadOnly bool, limit, offset int) ([]Notification, error) {
+	allowedResources = nonNilResources(allowedResources)
 	limit, offset = NormalizePaging(limit, offset)
 
 	query := `SELECT ` + notificationColumns + `
@@ -167,6 +184,7 @@ func (s *PGStore) ListForUser(ctx context.Context, tenantID, recipientUserID str
 // CountForUser returns the total number of feed rows matching the same
 // filter ListForUser applies, ignoring paging.
 func (s *PGStore) CountForUser(ctx context.Context, tenantID, recipientUserID string, allowedResources []string, unreadOnly bool) (int, error) {
+	allowedResources = nonNilResources(allowedResources)
 	query := `SELECT COUNT(*) FROM notifications
 		WHERE tenant_id = $1 AND recipient_user_id = $2 AND visible_in_app = true
 		AND (cardinality($3::text[]) = 0 OR resource = ANY($3::text[]))`
@@ -184,6 +202,7 @@ func (s *PGStore) CountForUser(ctx context.Context, tenantID, recipientUserID st
 // UnreadCount returns the number of unread notifications for the recipient —
 // the value the frontend bell polls.
 func (s *PGStore) UnreadCount(ctx context.Context, tenantID, recipientUserID string, allowedResources []string) (int, error) {
+	allowedResources = nonNilResources(allowedResources)
 	var count int
 	err := s.pool.QueryRow(ctx, `
 		SELECT COUNT(*) FROM notifications
@@ -215,6 +234,7 @@ func (s *PGStore) MarkRead(ctx context.Context, tenantID, recipientUserID, id st
 // MarkAllRead marks every unread notification within allowedResources for
 // the recipient as read (empty allowedResources means unrestricted).
 func (s *PGStore) MarkAllRead(ctx context.Context, tenantID, recipientUserID string, allowedResources []string) error {
+	allowedResources = nonNilResources(allowedResources)
 	if _, err := s.pool.Exec(ctx, `
 		UPDATE notifications SET read_at = NOW()
 		WHERE tenant_id = $1 AND recipient_user_id = $2 AND read_at IS NULL
