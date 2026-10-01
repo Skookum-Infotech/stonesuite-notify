@@ -27,3 +27,21 @@ func TestEmailSendable(t *testing.T) {
 		})
 	}
 }
+
+func TestResendWebhookConfigured(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  Config
+		want bool
+	}{
+		{"unset", Config{}, false},
+		{"set", Config{ResendWebhookSecret: "whsec_abc"}, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.cfg.ResendWebhookConfigured(); got != tc.want {
+				t.Fatalf("ResendWebhookConfigured() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}

@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strconv"
 	"time"
+	"unicode/utf8"
 
 	"stonesuite-notify/audit"
 	"stonesuite-notify/config"
@@ -227,6 +228,12 @@ type createNotificationRequest struct {
 	Title       string            `json:"title"`
 	Body        string            `json:"body,omitempty"`
 	Link        string            `json:"link,omitempty"`
+	// StatusLink is the staff-side page a delivery-problem alert for this
+	// notification's email links to. Optional; at most maxStatusLinkChars.
+	StatusLink string `json:"statusLink,omitempty"`
+	// StatusResource is the RBAC resource that governs that page. Optional; at
+	// most maxStatusResourceChars.
+	StatusResource string `json:"statusResource,omitempty"`
 	Channels    []string          `json:"channels,omitempty"`
 	// EmailBodyHTML, when set, is used verbatim as the email's HTML body
 	// instead of the generic <h2>title</h2><p>body</p> template — see
@@ -240,6 +247,12 @@ type createNotificationRequest struct {
 }
 
 const channelEmail = "email"
+
+// Widths of notifications.status_link and notifications.status_resource.
+const (
+	maxStatusLinkChars     = 300
+	maxStatusResourceChars = 64
+)
 
 // Create handles POST /api/notifications/internal — called by another
 // StoneSuite service (not an end user) when a business event fires. Gated
@@ -257,6 +270,14 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(req.Recipients) == 0 {
 		fail(w, http.StatusBadRequest, "recipients is required.")
+		return
+	}
+	if utf8.RuneCountInString(req.StatusLink) > maxStatusLinkChars {
+		fail(w, http.StatusBadRequest, "statusLink must be at most 300 characters.")
+		return
+	}
+	if utf8.RuneCountInString(req.StatusResource) > maxStatusResourceChars {
+		fail(w, http.StatusBadRequest, "statusResource must be at most 64 characters.")
 		return
 	}
 
@@ -298,6 +319,8 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 			Title:           req.Title,
 			Body:            req.Body,
 			Link:            req.Link,
+			StatusLink:      req.StatusLink,
+			StatusResource:  req.StatusResource,
 		}
 		if err := in.Validate(); err != nil {
 			fail(w, http.StatusBadRequest, err.Error())

@@ -43,6 +43,16 @@ type CreateInput struct {
 	Title           string `json:"title"`
 	Body            string `json:"body,omitempty"`
 	Link            string `json:"link,omitempty"`
+	// StatusLink is where a delivery-problem alert for this notification's
+	// email should send the user: the staff-side page that shows the email's
+	// status. Optional; distinct from Link, which for a customer email is the
+	// customer's URL.
+	StatusLink string `json:"statusLink,omitempty"`
+	// StatusResource is the RBAC resource that governs that page ("invoice",
+	// "user", "portal_access", …). The alert is stored under it so the bell's
+	// accessible_resources filter shows it to the sender; empty falls back to
+	// Resource.
+	StatusResource string `json:"statusResource,omitempty"`
 	VisibleInApp    bool   `json:"visibleInApp"`
 }
 

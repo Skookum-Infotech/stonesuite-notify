@@ -22,6 +22,7 @@ import (
 	"stonesuite-notify/controllers"
 	"stonesuite-notify/database"
 	"stonesuite-notify/deliveries"
+	"stonesuite-notify/emailevents"
 	"stonesuite-notify/middleware"
 	"stonesuite-notify/notifications"
 	"stonesuite-notify/preferences"
@@ -58,6 +59,9 @@ func main() {
 	if !cfg.EmailConfigured() {
 		log.Println("notice: no email provider configured (RESEND_API_KEY or SMTP_HOST) — email channel will be skipped")
 	}
+	if !cfg.ResendWebhookConfigured() {
+		log.Println("notice: no RESEND_WEBHOOK_SECRET — Resend delivery webhooks will be rejected (503); provider delivery status will not be tracked")
+	}
 	if !cfg.PushConfigured() {
 		log.Println("notice: no VAPID keys configured (VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY) — push channel will be skipped")
 	}
@@ -66,6 +70,7 @@ func main() {
 	pushStore := pushsubs.NewPGStore(pool)
 	prefStore := preferences.NewPGStore(pool)
 	deliveryStore := deliveries.NewPGStore(pool)
+	emailEventsStore := emailevents.NewPGStore(pool)
 	auditStore := audit.NewPGStore(pool)
 
 	// One recorder shared by every handler and both workers: audit writes
@@ -77,6 +82,7 @@ func main() {
 	pushHandler := controllers.NewPushHandler(pushStore, auditRecorder, cfg.VAPIDPublicKey)
 	prefHandler := controllers.NewPreferencesHandler(prefStore, auditRecorder)
 	auditHandler := controllers.NewAuditHandler(auditStore)
+	emailEventsHandler := controllers.NewEmailEventsHandler(emailEventsStore, cfg.ResendWebhookSecret)
 
 	workerDeps := workers.NewDeps(store, deliveryStore, pushStore, auditRecorder, cfg)
 	go workers.QueueConsumer{Deps: workerDeps}.Run(ctx)
@@ -97,6 +103,10 @@ func main() {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"success":true}`))
 	})
+
+	// Provider webhook: public by necessity (Resend holds no StoneSuite
+	// credentials). The Svix signature check inside the handler is its ONLY gate.
+	mux.HandleFunc("POST /api/webhooks/resend", emailEventsHandler.Resend)
 
 	requireInternal := middleware.RequireInternalSecret(cfg.InternalServiceSecret)
 
@@ -137,6 +147,7 @@ func main() {
 	mux.Handle("POST /api/notifications/internal", requireInternal(http.HandlerFunc(handler.Create)))
 	mux.Handle("GET /api/notifications/{id}/deliveries", requireInternal(http.HandlerFunc(handler.Deliveries)))
 	mux.Handle("GET /api/deliveries", requireInternal(http.HandlerFunc(handler.DeliveriesByStatus)))
+	mux.Handle("POST /api/deliveries/email-status", requireInternal(http.HandlerFunc(emailEventsHandler.EmailStatus)))
 	mux.Handle("PUT /api/tenant-defaults", requireInternal(http.HandlerFunc(prefHandler.SetTenantDefaults)))
 	mux.Handle("GET /api/audit-logs", requireInternal(http.HandlerFunc(auditHandler.ListInternal)))
 

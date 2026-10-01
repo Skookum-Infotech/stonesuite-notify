@@ -25,7 +25,10 @@ type Store interface {
 	// than staleProcessingAfter (a crash mid-send), recovering the latter
 	// as if it were a failed attempt.
 	ClaimDue(ctx context.Context, batchSize int, staleProcessingAfter time.Duration) ([]Delivery, error)
-	MarkSent(ctx context.Context, id string, providerResponse []byte) error
+	// MarkSent finalizes a delivery as sent. providerEmailID is the email
+	// provider's id for the message (Resend), recorded so its delivery
+	// webhooks can be matched to this row; "" when there is none (push, SMTP).
+	MarkSent(ctx context.Context, id string, providerResponse []byte, providerEmailID string) error
 	// MarkSkipped finalizes a delivery as skipped — nothing to deliver to
 	// (e.g. no push subscriptions) — which is not a failure and is never
 	// retried.
@@ -59,18 +62,23 @@ func NewPGStore(pool *pgxpool.Pool) *PGStore {
 	return &PGStore{pool: pool}
 }
 
-const deliveryColumns = `id, notification_id, tenant_id, recipient_user_id, channel, status, attempts, max_attempts, next_attempt_at, last_error, provider_response, created_at, updated_at`
+const deliveryColumns = `id, notification_id, tenant_id, recipient_user_id, channel, status, attempts, max_attempts, next_attempt_at, last_error, provider_response, provider_status, provider_status_at, created_at, updated_at`
 
 func scanDelivery(row pgx.Row) (*Delivery, error) {
 	var d Delivery
 	var recipientUserID *string
 	var lastError *string
+	var providerStatus *string
 	if err := row.Scan(
 		&d.ID, &d.NotificationID, &d.TenantID, &recipientUserID, &d.Channel, &d.Status,
 		&d.Attempts, &d.MaxAttempts, &d.NextAttemptAt, &lastError, &d.ProviderResponse,
+		&providerStatus, &d.ProviderStatusAt,
 		&d.CreatedAt, &d.UpdatedAt,
 	); err != nil {
 		return nil, err
+	}
+	if providerStatus != nil {
+		d.ProviderStatus = *providerStatus
 	}
 	if recipientUserID != nil {
 		d.RecipientUserID = *recipientUserID
@@ -150,11 +158,11 @@ func (s *PGStore) claim(ctx context.Context, query string, args ...any) ([]Deliv
 	return out, nil
 }
 
-func (s *PGStore) MarkSent(ctx context.Context, id string, providerResponse []byte) error {
+func (s *PGStore) MarkSent(ctx context.Context, id string, providerResponse []byte, providerEmailID string) error {
 	if _, err := s.pool.Exec(ctx, `
 		UPDATE notification_deliveries
-		SET status = 'sent', provider_response = $2, updated_at = NOW()
-		WHERE id = $1`, id, providerResponse); err != nil {
+		SET status = 'sent', provider_response = $2, provider_email_id = NULLIF($3, ''), updated_at = NOW()
+		WHERE id = $1`, id, providerResponse, providerEmailID); err != nil {
 		return fmt.Errorf("mark delivery %s sent: %w", id, err)
 	}
 	return nil

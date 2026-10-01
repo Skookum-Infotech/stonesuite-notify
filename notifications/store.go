@@ -97,10 +97,10 @@ func (s *PGStore) Create(ctx context.Context, in CreateInput) (*Notification, er
 
 	row := s.pool.QueryRow(ctx, `
 		INSERT INTO notifications
-			(tenant_id, recipient_user_id, recipient_email, actor_user_id, event_type, resource, resource_id, title, body, link, visible_in_app)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+			(tenant_id, recipient_user_id, recipient_email, actor_user_id, event_type, resource, resource_id, title, body, link, visible_in_app, status_link, status_resource)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 		RETURNING `+notificationColumns,
-		in.TenantID, recipientUserIDArg, in.RecipientEmail, actorUserIDArg, in.EventType, in.Resource, in.ResourceID, in.Title, in.Body, in.Link, in.VisibleInApp)
+		in.TenantID, recipientUserIDArg, in.RecipientEmail, actorUserIDArg, in.EventType, in.Resource, in.ResourceID, in.Title, in.Body, in.Link, in.VisibleInApp, in.StatusLink, in.StatusResource)
 
 	n, err := scanNotification(row)
 	if err != nil {
