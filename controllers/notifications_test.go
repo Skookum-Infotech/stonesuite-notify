@@ -30,6 +30,7 @@ const testJWTSecret = "test-secret"
 // without a real database.
 type fakeStore struct {
 	rows             []notifications.Notification
+	inputs           []notifications.CreateInput // every CreateInput seen, in order
 	nextID           int
 	forceErr         error
 	notFoundErr      bool
@@ -40,6 +41,7 @@ func (f *fakeStore) Create(_ context.Context, in notifications.CreateInput) (*no
 	if f.forceErr != nil {
 		return nil, f.forceErr
 	}
+	f.inputs = append(f.inputs, in)
 	f.nextID++
 	n := notifications.Notification{
 		ID:              itoa(f.nextID),
@@ -289,7 +291,7 @@ func (f *fakeDeliveriesStore) ClaimDue(_ context.Context, _ int, _ time.Duration
 	return nil, nil
 }
 
-func (f *fakeDeliveriesStore) MarkSent(_ context.Context, _ string, _ []byte) error { return nil }
+func (f *fakeDeliveriesStore) MarkSent(_ context.Context, _ string, _ []byte, _ string) error { return nil }
 
 func (f *fakeDeliveriesStore) MarkSkipped(_ context.Context, _ string, _ []byte) error { return nil }
 

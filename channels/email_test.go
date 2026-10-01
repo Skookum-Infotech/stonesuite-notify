@@ -16,7 +16,7 @@ func TestSendNotificationEmail_NoProviderConfigured_ReturnsError(t *testing.T) {
 	// email delivery, so "no provider" is a misconfiguration: it must fail
 	// (delivery -> retrying -> failed with a reason), never return nil,
 	// which would mark the delivery sent.
-	err := SendNotificationEmail(config.Config{}, "user@example.com", "title", "body", "", "", nil)
+	_, err := SendNotificationEmail(config.Config{}, "user@example.com", "title", "body", "", "", nil)
 	if err == nil {
 		t.Fatal("expected an error when no email provider is configured, got nil")
 	}
@@ -26,7 +26,7 @@ func TestSendNotificationEmail_NoProviderConfigured_ReturnsError(t *testing.T) {
 }
 
 func TestSendNotificationEmail_MissingRecipient_ReturnsError(t *testing.T) {
-	err := SendNotificationEmail(config.Config{}, "", "title", "body", "", "", nil)
+	_, err := SendNotificationEmail(config.Config{}, "", "title", "body", "", "", nil)
 	if err == nil {
 		t.Fatal("expected an error for an empty recipient address")
 	}
@@ -37,7 +37,7 @@ func TestSendNotificationEmail_ConfiguredButNoEmailFrom_ReturnsNamedError(t *tes
 	// misconfiguration that made Resend 422 every send. Must fail before the
 	// provider call, with a message that names EMAIL_FROM.
 	cfg := config.Config{ResendAPIKey: "re_test_key"}
-	err := SendNotificationEmail(cfg, "customer@example.com", "Invoice INV-1 sent", "body", "", "<p>branded</p>", nil)
+	_, err := SendNotificationEmail(cfg, "customer@example.com", "Invoice INV-1 sent", "body", "", "<p>branded</p>", nil)
 	if err == nil {
 		t.Fatal("expected an error when a provider is configured but EMAIL_FROM is unset")
 	}
@@ -58,7 +58,7 @@ func TestSendViaResend_ErrorIncludesResponseBody(t *testing.T) {
 	resendEndpoint = srv.URL
 	defer func() { resendEndpoint = orig }()
 
-	err := sendViaResend(config.Config{ResendAPIKey: "re_test_key", EmailFrom: "no-reply@stonesuite.app"},
+	_, err := sendViaResend(config.Config{ResendAPIKey: "re_test_key", EmailFrom: "no-reply@stonesuite.app"},
 		"customer@example.com", "Invoice INV-1 sent", "<p>branded</p>", "branded", nil)
 	if err == nil {
 		t.Fatal("expected an error on a 422 response")
@@ -85,7 +85,7 @@ func TestRenderEmailHTML_OmitsLinkWhenAbsent(t *testing.T) {
 func TestSendNotificationEmail_ProviderSetNoEmailFrom_FailsBeforeSend(t *testing.T) {
 	// SMTP host set, EMAIL_FROM empty: must fail without opening an SMTP
 	// connection, naming EMAIL_FROM (same guard as the Resend path).
-	err := SendNotificationEmail(config.Config{SMTPHost: "smtp.example.com"},
+	_, err := SendNotificationEmail(config.Config{SMTPHost: "smtp.example.com"},
 		"user@example.com", "title", "body", "", "", nil)
 	if err == nil || !strings.Contains(err.Error(), "EMAIL_FROM") {
 		t.Fatalf("expected an EMAIL_FROM error, got %v", err)
@@ -194,7 +194,7 @@ func TestSendViaResend_IncludesTextAndReplyTo(t *testing.T) {
 	defer func() { resendEndpoint = orig }()
 
 	cfg := config.Config{ResendAPIKey: "re_test_key", EmailFrom: "no-reply@stonesuite.app", EmailReplyTo: "support@stonesuite.app"}
-	if err := sendViaResend(cfg, "customer@example.com", "You're invited", "<p>Welcome</p>", "Welcome", nil); err != nil {
+	if _, err := sendViaResend(cfg, "customer@example.com", "You're invited", "<p>Welcome</p>", "Welcome", nil); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if got.Text != "Welcome" {
@@ -217,10 +217,53 @@ func TestSendViaResend_OmitsReplyToWhenUnset(t *testing.T) {
 	defer func() { resendEndpoint = orig }()
 
 	cfg := config.Config{ResendAPIKey: "re_test_key", EmailFrom: "no-reply@stonesuite.app"}
-	if err := sendViaResend(cfg, "customer@example.com", "Subject", "<p>x</p>", "x", nil); err != nil {
+	if _, err := sendViaResend(cfg, "customer@example.com", "Subject", "<p>x</p>", "x", nil); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if strings.Contains(string(rawBody), "reply_to") {
 		t.Fatalf("expected reply_to omitted when EmailReplyTo is empty, got:\n%s", rawBody)
+	}
+}
+
+func TestSendViaResend_ReturnsProviderEmailID(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"49a3999c-0ce1-4ea6-ab68-afcd6dc2e794"}`))
+	}))
+	defer srv.Close()
+
+	orig := resendEndpoint
+	resendEndpoint = srv.URL
+	defer func() { resendEndpoint = orig }()
+
+	id, err := sendViaResend(config.Config{ResendAPIKey: "re_test_key", EmailFrom: "no-reply@stonesuite.app"},
+		"customer@example.com", "Subject", "<p>x</p>", "x", nil)
+	if err != nil {
+		t.Fatalf("sendViaResend: %v", err)
+	}
+	if id != "49a3999c-0ce1-4ea6-ab68-afcd6dc2e794" {
+		t.Fatalf("provider id = %q, want the id from Resend's response", id)
+	}
+}
+
+func TestSendViaResend_UnparseableSuccessBodyIsNotAnError(t *testing.T) {
+	// The email was accepted; losing the id only means no webhook tracking.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`not json`))
+	}))
+	defer srv.Close()
+
+	orig := resendEndpoint
+	resendEndpoint = srv.URL
+	defer func() { resendEndpoint = orig }()
+
+	id, err := sendViaResend(config.Config{ResendAPIKey: "re_test_key", EmailFrom: "no-reply@stonesuite.app"},
+		"customer@example.com", "Subject", "<p>x</p>", "x", nil)
+	if err != nil {
+		t.Fatalf("a 2xx with a bad body must not be an error, got %v", err)
+	}
+	if id != "" {
+		t.Fatalf("provider id = %q, want empty", id)
 	}
 }

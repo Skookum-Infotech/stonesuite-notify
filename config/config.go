@@ -33,7 +33,11 @@ type Config struct {
 	// email. Optional: transactional mail with a real reply address scores
 	// better with spam filters than a bare no-reply From. Unset ⇒ no header.
 	EmailReplyTo string
-	SMTPHost     string
+	// ResendWebhookSecret is the signing secret ("whsec_…") Resend shows when a
+	// webhook endpoint is created. It authenticates POST /api/webhooks/resend,
+	// which has no other gate. Optional: unset ⇒ the route answers 503.
+	ResendWebhookSecret string
+	SMTPHost            string
 	SMTPPort     string
 	SMTPUsername string
 	SMTPPassword string
@@ -59,6 +63,8 @@ func Load() (Config, error) {
 		ResendAPIKey: os.Getenv("RESEND_API_KEY"),
 		EmailFrom:    os.Getenv("EMAIL_FROM"),
 		EmailReplyTo: os.Getenv("EMAIL_REPLY_TO"),
+
+		ResendWebhookSecret: os.Getenv("RESEND_WEBHOOK_SECRET"),
 		SMTPHost:     os.Getenv("SMTP_HOST"),
 		SMTPPort:     getEnv("SMTP_PORT", "587"),
 		SMTPUsername: os.Getenv("SMTP_USERNAME"),
@@ -103,6 +109,12 @@ func (c Config) EmailSendable() bool {
 // PushConfigured reports whether VAPID keys are present for web push.
 func (c Config) PushConfigured() bool {
 	return c.VAPIDPublicKey != "" && c.VAPIDPrivateKey != ""
+}
+
+// ResendWebhookConfigured reports whether provider delivery webhooks can be
+// verified (a signing secret is set).
+func (c Config) ResendWebhookConfigured() bool {
+	return c.ResendWebhookSecret != ""
 }
 
 func getEnv(key, fallback string) string {

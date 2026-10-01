@@ -225,3 +225,50 @@ ALTER TABLE notification_attachments ADD COLUMN IF NOT EXISTS email_body_html TE
 -- which is workers-only and not tenant-scoped.
 CREATE INDEX IF NOT EXISTS idx_deliveries_tenant_status
     ON notification_deliveries (tenant_id, status, updated_at DESC);
+
+-- ── Provider (Resend) delivery lifecycle ──────────────────────────────
+-- notification_deliveries.status is the SEND-QUEUE state the workers claim on
+-- (pending -> sent/retrying/failed). What the email provider reports AFTER
+-- accepting a message (delivered / delayed / bounced / complained / ...) is a
+-- different thing and lives in its own columns so the two can never be
+-- confused or race. provider_email_id is Resend's id for the sent email -- the
+-- key the webhook uses to find its row. NULL for SMTP sends (no webhooks).
+ALTER TABLE notification_deliveries ADD COLUMN IF NOT EXISTS provider_email_id  TEXT;
+ALTER TABLE notification_deliveries ADD COLUMN IF NOT EXISTS provider_status    VARCHAR(24);
+ALTER TABLE notification_deliveries ADD COLUMN IF NOT EXISTS provider_status_at TIMESTAMPTZ;
+ALTER TABLE notification_deliveries ADD COLUMN IF NOT EXISTS provider_detail    TEXT;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_deliveries_provider_email
+    ON notification_deliveries (provider_email_id) WHERE provider_email_id IS NOT NULL;
+
+-- Where the sender should land when an in-app delivery-problem alert is
+-- clicked (the staff-side page that shows the email's status badge). Distinct
+-- from link, which for a customer document email is the CUSTOMER's URL.
+ALTER TABLE notifications ADD COLUMN IF NOT EXISTS status_link VARCHAR(300) NOT NULL DEFAULT '';
+
+-- The RBAC resource that governs the page status_link opens ("invoice", "user",
+-- "portal_access", ...). The in-app bell only shows a notification whose resource
+-- the reader may Read, so a delivery-problem alert must carry THIS resource, not
+-- the original email's: e.g. a portal invite's resource "portal_user" is not an
+-- RBAC resource at all, and an alert copied from it would be invisible to every
+-- sender who is not a super admin. Empty => fall back to the original's resource.
+ALTER TABLE notifications ADD COLUMN IF NOT EXISTS status_resource VARCHAR(64) NOT NULL DEFAULT '';
+
+-- Append-only log of provider webhook events that matched a delivery.
+-- svix_id is Resend's per-message id: UNIQUE makes a redelivered webhook a
+-- no-op. The raw payload is deliberately NOT stored (it carries the recipient
+-- address and subject); only the event type, time and a short detail string.
+CREATE TABLE IF NOT EXISTS email_events (
+    id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    svix_id           TEXT        NOT NULL UNIQUE,
+    delivery_id       UUID        NOT NULL REFERENCES notification_deliveries(id) ON DELETE CASCADE,
+    tenant_id         UUID        NOT NULL,
+    provider_email_id TEXT        NOT NULL,
+    event_type        VARCHAR(32) NOT NULL,
+    occurred_at       TIMESTAMPTZ NOT NULL,
+    detail            TEXT,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_email_events_delivery
+    ON email_events (delivery_id, occurred_at);

@@ -30,7 +30,7 @@ type Deps struct {
 	PushSubs      pushsubs.Store
 	Audit         audit.Recorder
 	Config        config.Config
-	SendEmail     func(cfg config.Config, to, title, body, link, emailBodyHTML string, attachment *channels.EmailAttachment) error
+	SendEmail     func(cfg config.Config, to, title, body, link, emailBodyHTML string, attachment *channels.EmailAttachment) (string, error)
 	SendPush      func(cfg config.Config, sub channels.PushSubscription, title, body, link string) (stale bool, err error)
 }
 
@@ -118,12 +118,13 @@ func attemptEmail(ctx context.Context, deps Deps, d deliveries.Delivery, n notif
 		}
 	}
 
-	if err := deps.SendEmail(deps.Config, n.RecipientEmail, n.Title, n.Body, n.Link, emailBodyHTML, attachment); err != nil {
+	providerID, err := deps.SendEmail(deps.Config, n.RecipientEmail, n.Title, n.Body, n.Link, emailBodyHTML, attachment)
+	if err != nil {
 		log.Printf("workers: email delivery %s: %v", d.ID, err)
 		markFailedAttempt(ctx, deps, d, err.Error(), nil)
 		return
 	}
-	if err := deps.Deliveries.MarkSent(ctx, d.ID, nil); err != nil {
+	if err := deps.Deliveries.MarkSent(ctx, d.ID, nil, providerID); err != nil {
 		log.Printf("workers: mark email delivery %s sent: %v", d.ID, err)
 	}
 	recordOutcome(ctx, deps, d, audit.ActionDeliverySent, map[string]any{})
@@ -174,7 +175,7 @@ func attemptPush(ctx context.Context, deps Deps, d deliveries.Delivery, n notifi
 	responseJSON, _ := json.Marshal(pushProviderResponse{Endpoints: outcomes})
 
 	if allSent {
-		if err := deps.Deliveries.MarkSent(ctx, d.ID, responseJSON); err != nil {
+		if err := deps.Deliveries.MarkSent(ctx, d.ID, responseJSON, ""); err != nil {
 			log.Printf("workers: mark push delivery %s sent: %v", d.ID, err)
 		}
 		recordOutcome(ctx, deps, d, audit.ActionDeliverySent, map[string]any{"endpoints": len(outcomes)})

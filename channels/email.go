@@ -52,9 +52,12 @@ type EmailAttachment struct {
 // template — used by callers (e.g. a document-send customer email) that
 // need their own branding. Errors are returned for the worker to log and
 // retry on, never surfaced to the notification-create response.
-func SendNotificationEmail(cfg config.Config, to, title, body, link, emailBodyHTML string, attachment *EmailAttachment) error {
+// It returns the provider's id for the sent email (Resend only; "" for SMTP),
+// which the worker stores so the provider's delivery webhooks can be matched
+// to this delivery.
+func SendNotificationEmail(cfg config.Config, to, title, body, link, emailBodyHTML string, attachment *EmailAttachment) (string, error) {
 	if to == "" {
-		return fmt.Errorf("email channel: recipient address is empty")
+		return "", fmt.Errorf("email channel: recipient address is empty")
 	}
 	// A configured provider with no EMAIL_FROM cannot send: Resend rejects
 	// the request with HTTP 422 (invalid "from"), and SMTP has no envelope
@@ -63,7 +66,7 @@ func SendNotificationEmail(cfg config.Config, to, title, body, link, emailBodyHT
 	// secret, easy to drop in a secrets reset and (historically) documented
 	// only under SMTP.
 	if cfg.EmailConfigured() && cfg.EmailFrom == "" {
-		return fmt.Errorf("email channel: EMAIL_FROM is not set (required as the sender address for Resend and SMTP alike)")
+		return "", fmt.Errorf("email channel: EMAIL_FROM is not set (required as the sender address for Resend and SMTP alike)")
 	}
 
 	htmlBody := emailBodyHTML
@@ -81,13 +84,13 @@ func SendNotificationEmail(cfg config.Config, to, title, body, link, emailBodyHT
 	case cfg.ResendAPIKey != "":
 		return sendViaResend(cfg, to, title, htmlBody, textBody, attachment)
 	case cfg.SMTPHost != "":
-		return sendViaSMTP(cfg, to, title, htmlBody, textBody, attachment)
+		return "", sendViaSMTP(cfg, to, title, htmlBody, textBody, attachment)
 	default:
 		// A delivery row only reaches this worker because Create decided
 		// email was wanted and enabled — so "no provider" here is a
 		// misconfiguration, not a no-op. Return an error so the delivery
 		// goes retrying -> failed with a clear reason, never marked sent.
-		return fmt.Errorf("email channel: no provider configured (set RESEND_API_KEY or SMTP_HOST, plus EMAIL_FROM)")
+		return "", fmt.Errorf("email channel: no provider configured (set RESEND_API_KEY or SMTP_HOST, plus EMAIL_FROM)")
 	}
 }
 
@@ -147,7 +150,14 @@ type resendRequest struct {
 	Attachments []resendAttachment `json:"attachments,omitempty"`
 }
 
-func sendViaResend(cfg config.Config, to, subject, htmlBody, textBody string, attachment *EmailAttachment) error {
+// resendResponse is the success body of Resend's POST /emails.
+type resendResponse struct {
+	ID string `json:"id"`
+}
+
+// sendViaResend sends through Resend and returns Resend's id for the accepted
+// email ("" if the response carried none).
+func sendViaResend(cfg config.Config, to, subject, htmlBody, textBody string, attachment *EmailAttachment) (string, error) {
 	req := resendRequest{
 		From:    cfg.EmailFrom,
 		To:      to,
@@ -164,20 +174,20 @@ func sendViaResend(cfg config.Config, to, subject, htmlBody, textBody string, at
 	}
 	payload, err := json.Marshal(req)
 	if err != nil {
-		return fmt.Errorf("resend: encode request: %w", err)
+		return "", fmt.Errorf("resend: encode request: %w", err)
 	}
 
 	client := &http.Client{Timeout: emailTimeout}
 	httpReq, err := http.NewRequest(http.MethodPost, resendEndpoint, bytes.NewReader(payload))
 	if err != nil {
-		return fmt.Errorf("resend: build request: %w", err)
+		return "", fmt.Errorf("resend: build request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Authorization", "Bearer "+cfg.ResendAPIKey)
 
 	resp, err := client.Do(httpReq)
 	if err != nil {
-		return fmt.Errorf("resend: send: %w", err)
+		return "", fmt.Errorf("resend: send: %w", err)
 	}
 	defer resp.Body.Close()
 
@@ -187,9 +197,16 @@ func sendViaResend(cfg config.Config, to, subject, htmlBody, textBody string, at
 		// bare status code hides. This lands in notification_deliveries.last_error
 		// and the worker log, so a recurring 422 is self-diagnosing.
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
-		return fmt.Errorf("resend: unexpected status %d: %s", resp.StatusCode, bytes.TrimSpace(body))
+		return "", fmt.Errorf("resend: unexpected status %d: %s", resp.StatusCode, bytes.TrimSpace(body))
 	}
-	return nil
+
+	// The email was accepted. Its id is what Resend's later delivery webhooks
+	// refer to; failing to read it must not fail a send that already happened.
+	var accepted resendResponse
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 4<<10)).Decode(&accepted); err != nil {
+		return "", nil
+	}
+	return accepted.ID, nil
 }
 
 func sendViaSMTP(cfg config.Config, to, subject, htmlBody, textBody string, attachment *EmailAttachment) error {
